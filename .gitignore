@@ -1,0 +1,32 @@
+# Session & Cache
+.wa-session/
+.wwebjs_cache/
+
+# Logs
+*.log
+approvals.log
+watchdog.log
+logs/
+
+# Cache & Config
+node_modules/
+package-lock.json
+*.json
+
+# Environment
+.env
+.env.production
+.env.local
+
+# Rosters
+rosters/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.iml

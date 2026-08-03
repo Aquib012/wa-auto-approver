@@ -1,0 +1,805 @@
+// WhatsApp group auto-approver for paid GrowthX community leads.
+// - Groups are configured in a Google Sheet (CSV URL below) or FALLBACK_GROUPS.
+// - Each WhatsApp group maps to its GrowthX funnel(s); only status=Paid leads
+//   with amount MIN-MAX in the last DAYS_BACK days are approved.
+// - Human-like behavior: jittered intervals, night pause (IST), delayed approvals.
+// - Unpaid requests are left pending for manual review.
+
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const path = require('path');
+
+// ================== CONFIG ==================
+const API_BASE = 'https://growthx.skillarbitra.ge/api/public/leads';
+
+// MASTER SHEET ID — all config comes from Google Sheet tabs
+// Update this to YOUR sheet ID
+const MASTER_SHEET_ID = '1axEuQqoaGT6b5niI5lk_MHERyTVLDx9OjqjhVPEZOjk';
+
+// Sheet tab URLs (gid = sheet tab ID)
+const CONFIG_SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${MASTER_SHEET_ID}/export?format=csv&gid=2`; // "Config" tab
+const GROUPS_SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${MASTER_SHEET_ID}/export?format=csv&gid=0`; // "Groups" tab
+const ALTERNATE_NUMBERS_SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${MASTER_SHEET_ID}/export?format=csv&gid=1339372007`; // "Alternate_number_Requests" tab
+
+// Default config (fallback if sheet doesn't load)
+let config = {
+  API_TOKEN: process.env.GROWTHX_API_KEY || 'Hubxev<pNl3sUu79', // Use env var or fallback
+  MIN_AMOUNT: 100,
+  MAX_AMOUNT: 300,
+  DAYS_BACK: 14,
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
+  ALERT_WEBHOOK_URL: process.env.ALERT_WEBHOOK_URL || '',
+  ROSTER_WEBHOOK_URL: process.env.ROSTER_WEBHOOK_URL || '',
+};
+
+// Shorthand to access current config values
+const getConfig = (key) => config[key];
+
+// Friendly sheet names -> exact GrowthX API group values
+const API_GROUP_ALIASES = {
+  'criminal': 'Criminal Litigation',
+  'criminal litigation': 'Criminal Litigation',
+  'women ai': 'AI for Women',
+  'ai for women': 'AI for Women',
+  'ai for legal': 'Legal AI',
+  'legal ai': 'Legal AI',
+  'm&a': 'MnA',
+  'm & a': 'MnA',
+  'mna': 'MnA',
+  'sqe': 'SQE',
+  'sqe 7 day': 'SQE',
+  'arbitration': 'Arbitration',
+  'contract drafting': 'Contract Drafting',
+  'independent director': 'Independent Director',
+  'id': 'Independent Director',
+};
+
+function canonicalApiGroup(name) {
+  const k = String(name).trim().toLowerCase().replace(/\s+/g, ' ');
+  return API_GROUP_ALIASES[k] || String(name).trim();
+}
+
+const FALLBACK_GROUPS = [
+  { label: 'ID 76',             inviteLink: 'https://chat.whatsapp.com/D2UdMmSHy4x3TrDMQVRFu5', apiGroups: ['Independent Director'] },
+  { label: 'Contract Drafting', inviteLink: 'https://chat.whatsapp.com/HSGGdhy8KYL7IJpSsEsfuf', apiGroups: ['Contract Drafting'] },
+  { label: 'Criminal 63',       inviteLink: 'https://chat.whatsapp.com/GNoZXzBaNrzHKNPkq2N6hx', apiGroups: ['Criminal Litigation'] },
+  { label: 'Women AI 33',       inviteLink: 'https://chat.whatsapp.com/JMtnfp3iFhEDZx3TqSNFYx', apiGroups: ['AI for Women'] },
+  { label: 'AI for Legal 11',   inviteLink: 'https://chat.whatsapp.com/HYe9QW1DvTiK0zCkVZl03N', apiGroups: ['Legal AI'] },
+  { label: 'MnA 10',            inviteLink: 'https://chat.whatsapp.com/E2uDiOo9fBi2cn80kuw4V3', apiGroups: ['MnA'] },
+  { label: 'SQE 6',             inviteLink: 'https://chat.whatsapp.com/B9KbqL4OWKT3nW6dhVNiRO', apiGroups: ['SQE'] },
+  { label: 'Arbitration 5',     inviteLink: 'https://chat.whatsapp.com/GC9YAFTr8AK5YTCEcfvwN5', apiGroups: ['Arbitration'] },
+];
+
+const DRY_RUN = false;
+
+// Human-like pacing
+const CHECK_MIN_MINUTES = 3,  CHECK_MAX_MINUTES = 7;    // pending-request sweep
+const REFRESH_MIN_MINUTES = 12, REFRESH_MAX_MINUTES = 18; // sheet + paid-list refresh
+const APPROVE_DELAY_MIN_S = 20, APPROVE_DELAY_MAX_S = 90; // pause before approving a batch
+const NIGHT_START_HOUR = 23, NIGHT_END_HOUR = 7;          // IST quiet hours
+
+// Fresh-payer check: someone who paid minutes ago isn't in the cached list yet.
+// For requests newer than this, do a targeted 2-day API lookup before rejecting.
+const FRESH_REQUEST_MAX_AGE_MIN = 90;
+const FRESH_CHECK_COOLDOWN_MIN = 20;   // don't re-query the same number more often
+
+// Daily summary sent to this number on WhatsApp ('' = the linked account itself).
+const SUMMARY_TO_NUMBER = '';
+const SUMMARY_HOUR_IST = 21;
+
+// Member roster audit: every current group member tallied against payment records.
+const ROSTER_HOURS_IST = [10, 19];     // runs once per listed hour, per day
+const ROSTER_DAYS_BACK = 90;           // wider window — members may have paid months ago
+// Apps Script web-app URL that appends rows to your sheet (see roster-appscript.gs).
+const ROSTER_WEBHOOK_URL = '';
+
+const LOG_FILE = path.join(__dirname, 'approvals.log');
+const STATUS_FILE = path.join(__dirname, 'status.json');   // heartbeat for watchdog.js
+const PAID_CACHE_FILE = path.join(__dirname, 'paid-cache.json');
+const LID_CACHE_FILE = path.join(__dirname, 'lid-cache.json'); // member id -> phone, reused across runs
+const ROSTER_DIR = path.join(__dirname, 'rosters');
+// ============================================
+
+let watched = [];        // active group entries (state carried across refreshes)
+let nightLogged = false;
+const freshCheckedAt = new Map();  // "label|phone" -> ms of last targeted lookup
+let stats = { date: '', approved: 0, pending: 0, names: [] };
+let alternateNumbers = new Map();  // alternate_phone -> {original_phone, name, group, funnel}
+
+function log(msg) {
+  const line = `[${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}] ${msg}`;
+  console.log(line);
+  fs.appendFileSync(LOG_FILE, line + '\n');
+}
+
+function normalizePhone(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : '';
+}
+
+function fmtDate(d) { return d.toISOString().slice(0, 10); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const rand = (min, max) => min + Math.random() * (max - min);
+
+function istHour() {
+  return parseInt(new Date().toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', hour12: false }), 10);
+}
+
+function isNight() {
+  const h = istHour();
+  return NIGHT_START_HOUR > NIGHT_END_HOUR
+    ? (h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR)
+    : (h >= NIGHT_START_HOUR && h < NIGHT_END_HOUR);
+}
+
+function istDateStr() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
+// Heartbeat for watchdog.js — written after every sweep and on session events
+function writeStatus(extra = {}) {
+  try {
+    fs.writeFileSync(STATUS_FILE, JSON.stringify({
+      updatedAt: Date.now(),
+      updatedAtIST: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+      groups: watched.length,
+      paidCounts: Object.fromEntries(watched.map((e) => [e.label, e.paidSet ? e.paidSet.size : 0])),
+      night: isNight(),
+      today: stats,
+      ...extra,
+    }, null, 2));
+  } catch (e) { /* status file is best-effort */ }
+}
+
+// Persist paid lists so a restart starts warm and a failed refresh can't empty them
+function savePaidCache() {
+  try {
+    const dump = watched.map((e) => ({
+      inviteLink: e.inviteLink,
+      phones: e.paidSet ? [...e.paidSet] : [],
+      info: e.paidInfo || {},
+    }));
+    fs.writeFileSync(PAID_CACHE_FILE, JSON.stringify(dump));
+  } catch (e) { log(`Could not save paid cache: ${e.message}`); }
+}
+
+function loadPaidCache() {
+  try {
+    if (!fs.existsSync(PAID_CACHE_FILE)) return;
+    const dump = JSON.parse(fs.readFileSync(PAID_CACHE_FILE, 'utf8'));
+    const byLink = new Map(dump.map((d) => [d.inviteLink, d]));
+    let restored = 0;
+    for (const entry of watched) {
+      const d = byLink.get(entry.inviteLink);
+      if (d && d.phones.length) {
+        entry.paidSet = new Set(d.phones);
+        entry.paidInfo = d.info || {};
+        restored += d.phones.length;
+      }
+    }
+    if (restored) log(`Warm start: restored ${restored} cached paid numbers from disk.`);
+  } catch (e) { log(`Could not load paid cache: ${e.message}`); }
+}
+
+// GET with one retry on rate-limit / transient failure
+async function apiGet(url, label) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const token = config.API_TOKEN || getConfig('API_TOKEN');
+      const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      if (resp.ok) return await resp.json();
+      if (resp.status === 429 && attempt === 1) {
+        log(`[${label}] API 429 — retrying in 20s`);
+        await sleep(20000);
+        continue;
+      }
+      log(`[${label}] API error ${resp.status}`);
+      return null;
+    } catch (e) {
+      if (attempt === 1) { await sleep(5000); continue; }
+      log(`[${label}] API fetch failed: ${e.message}`);
+      return null;
+    }
+  }
+  return null;
+}
+
+// Targeted lookup for someone whose payment may not be in the cached list yet.
+// Scoped to the day they requested to join (payment normally precedes the request
+// by hours or a day or two), which also covers requests older than the cache window.
+async function lookupRecentPayment(entry, phone, requestUnixTime) {
+  const key = `${entry.label}|${phone}`;
+  const last = freshCheckedAt.get(key) || 0;
+  if (Date.now() - last < FRESH_CHECK_COOLDOWN_MIN * 60 * 1000) return null;
+  freshCheckedAt.set(key, Date.now());
+
+  const anchor = requestUnixTime ? new Date(requestUnixTime * 1000) : new Date();
+  const from = new Date(anchor); from.setDate(from.getDate() - 3);
+  const to = new Date(anchor);   to.setDate(to.getDate() + 1);
+  const today = new Date();
+  if (to > today) to.setTime(today.getTime());
+  const url = `${API_BASE}?from=${fmtDate(from)}&to=${fmtDate(to)}&group=${encodeURIComponent(entry.apiGroups.join(','))}`;
+  const data = await apiGet(url, entry.label);
+  if (!data) return null;
+
+  for (const l of data.leads || []) {
+    const amt = parseFloat(l.amount);
+    if (l.status === 'Paid' && amt >= MIN_AMOUNT && amt <= MAX_AMOUNT && normalizePhone(l.whatsapp) === phone) {
+      const info = { name: l.name, amount: l.amount, group: l.group };
+      if (!entry.paidSet) { entry.paidSet = new Set(); entry.paidInfo = {}; }
+      entry.paidSet.add(phone);
+      entry.paidInfo[phone] = info;
+      return info;
+    }
+  }
+  return null;
+}
+
+// Minimal CSV parser (handles quoted fields with commas)
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (c === '"') inQuotes = false;
+      else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (field !== '' || row.length) { row.push(field); rows.push(row); row = []; field = ''; }
+    } else field += c;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Sync configuration from "Config" sheet tab (key-value pairs)
+// Format: Column A = Key, Column B = Value
+// Keys: GROWTHX_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALERT_WEBHOOK_URL, ROSTER_WEBHOOK_URL, etc.
+async function syncConfigSheet() {
+  try {
+    const resp = await fetch(CONFIG_SHEET_CSV_URL, { redirect: 'follow' });
+    if (!resp.ok) {
+      log(`Config sheet fetch error ${resp.status} — using existing config`);
+      return;
+    }
+    const rows = parseCsv(await resp.text());
+    let updated = 0;
+    rows.slice(1).forEach((r) => {
+      if (r.length >= 2) {
+        const key = String(r[0] || '').trim();
+        const value = String(r[1] || '').trim();
+        if (key && value && config.hasOwnProperty(key)) {
+          config[key] = value;
+          updated++;
+        }
+      }
+    });
+    if (updated > 0) log(`Config sheet synced: ${updated} values loaded`);
+  } catch (e) {
+    log(`Config sheet sync failed: ${e.message}`);
+  }
+}
+
+// Load desired group list from the sheet (or fallback), merge into `watched`
+// keeping resolved groupIds and paid lists for unchanged entries.
+async function syncAlternateNumbers() {
+  const newMap = new Map();
+  if (!ALTERNATE_NUMBERS_SHEET_CSV_URL) return;
+  try {
+    const resp = await fetch(ALTERNATE_NUMBERS_SHEET_CSV_URL, { redirect: 'follow' });
+    if (!resp.ok) {
+      log(`Alternate numbers sheet fetch error ${resp.status}`);
+      return;
+    }
+    const rows = parseCsv(await resp.text());
+    const header = rows[0].map((h) => h.trim().toLowerCase());
+    const findCol = (...terms) => header.findIndex((h) => terms.some((t) => h.includes(t)));
+    const tsCol = findCol('timestamp');
+    const altCol = findCol('alternate');
+    const origCol = findCol('used in payment') ? header.findIndex((h) => h.includes('used in payment') && h.includes('mobile')) : -1;
+    const nameCol = findCol('name');
+    const groupCol = findCol('group');
+    const funnelCol = findCol('funnel');
+
+    if (altCol === -1 || origCol === -1 || funnelCol === -1) {
+      log(`Alternate sheet missing a required column (alternate=${altCol}, original=${origCol}, funnel=${funnelCol})`);
+      return;
+    }
+
+    const currentMonth = new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' }).slice(0, 7); // "2026-08"
+    rows.slice(1).forEach((r) => {
+      // Only index entries from the current month (faster, more likely to match current requests)
+      if (tsCol >= 0) {
+        const ts = String(r[tsCol] || '');
+        if (!ts.startsWith(currentMonth)) return;  // skip old entries
+      }
+      const alt = normalizePhone(r[altCol]);
+      const orig = normalizePhone(r[origCol]);
+      const funnel = (r[funnelCol] || '').trim();
+      if (alt && orig && funnel) {
+        newMap.set(alt, {
+          original_phone: orig,
+          name: (r[nameCol] || '').trim(),
+          group: (r[groupCol] || '').trim(),
+          funnel: funnel,
+        });
+      }
+    });
+
+    if (newMap.size > 0) {
+      alternateNumbers = newMap;
+      log(`Alternate numbers sheet (${currentMonth}): ${newMap.size} alternate→original mappings loaded`);
+    }
+  } catch (e) {
+    log(`Alternate numbers sheet fetch failed: ${e.message}`);
+  }
+}
+
+async function syncConfig() {
+  let desired = FALLBACK_GROUPS;
+  if (GROUPS_SHEET_CSV_URL) {
+    try {
+      const resp = await fetch(GROUPS_SHEET_CSV_URL, { redirect: 'follow' });
+      if (resp.ok) {
+        const rows = parseCsv(await resp.text());
+        const header = rows[0].map((h) => h.trim().toLowerCase());
+        const findCol = (...terms) => header.findIndex((h) => terms.some((t) => h.includes(t)));
+        const groupCol = findCol('group');
+        const linkCol = findCol('invite', 'link');
+        const labelCol = findCol('label');
+        const activeCol = findCol('active');
+        if (groupCol === -1 || linkCol === -1) {
+          log('Sheet missing a group or invite-link column — using fallback config');
+          return;
+        }
+        const parsed = rows.slice(1)
+          .filter((r) => (r[linkCol] || '').includes('chat.whatsapp.com'))
+          .filter((r) => activeCol === -1 || /^y/i.test((r[activeCol] || 'yes').trim() || 'yes'))
+          .map((r) => ({
+            label: ((labelCol !== -1 && r[labelCol]) || r[groupCol] || '').trim(),
+            inviteLink: r[linkCol].trim(),
+            apiGroups: (r[groupCol] || '').split(',').map(canonicalApiGroup).filter(Boolean),
+          }))
+          .filter((e) => e.apiGroups.length);
+        if (parsed.length) desired = parsed;
+        else log('Sheet loaded but no valid active rows — using fallback config');
+      } else {
+        log(`Sheet fetch error ${resp.status} — keeping current config`);
+        return;
+      }
+    } catch (e) {
+      log(`Sheet fetch failed: ${e.message} — keeping current config`);
+      return;
+    }
+  }
+
+  const prev = new Map(watched.map((e) => [e.inviteLink, e]));
+  watched = desired.map((d) => {
+    const old = prev.get(d.inviteLink);
+    return old ? Object.assign(old, { label: d.label, apiGroups: d.apiGroups }) : { ...d };
+  });
+}
+
+async function resolveGroups(client) {
+  for (const entry of watched) {
+    if (entry.groupId || !entry.inviteLink) continue;
+    const code = String(entry.inviteLink).split('chat.whatsapp.com/')[1];
+    if (!code) { log(`[${entry.label}] Could not parse invite link`); continue; }
+    try {
+      const info = await client.getInviteInfo(code.replace(/[/?#].*$/, ''));
+      entry.groupId = info.id._serialized || `${info.id.user}@g.us`;
+      log(`[${entry.label}] Resolved "${info.subject}" -> ${entry.groupId}`);
+    } catch (e) {
+      log(`[${entry.label}] Failed to resolve invite link: ${e.message}`);
+    }
+  }
+}
+
+async function refreshPaidListFor(entry) {
+  const newSet = new Set();
+  const newInfo = {};
+  const today = new Date();
+  const groupFilter = encodeURIComponent(entry.apiGroups.join(','));
+
+  let chunksOk = 0, chunksTotal = 0;
+  for (let start = DAYS_BACK; start > 0; start -= 7) {
+    chunksTotal++;
+    const from = new Date(today); from.setDate(from.getDate() - start);
+    const to = new Date(today);   to.setDate(to.getDate() - Math.max(start - 7, 0));
+    const url = `${API_BASE}?from=${fmtDate(from)}&to=${fmtDate(to)}&group=${groupFilter}`;
+    {
+      const data = await apiGet(url, entry.label);
+      if (!data) continue;
+      chunksOk++;
+      for (const l of data.leads || []) {
+        const amt = parseFloat(l.amount);
+        // HARD RULE: only successful payments count — never Form only/Expired/Failed
+        if (l.status === 'Paid' && amt >= MIN_AMOUNT && amt <= MAX_AMOUNT) {
+          const phone = normalizePhone(l.whatsapp);
+          if (phone) {
+            newSet.add(phone);
+            newInfo[phone] = { name: l.name, amount: l.amount, group: l.group };
+          }
+        }
+      }
+    }
+  }
+
+  if (newSet.size === 0) {
+    log(`[${entry.label}] Paid list refresh returned 0 rows — keeping previous list (${entry.paidSet ? entry.paidSet.size : 0})`);
+    return;
+  }
+
+  if (chunksOk === chunksTotal) {
+    entry.paidSet = newSet;
+    entry.paidInfo = newInfo;
+    log(`[${entry.label}] Paid list refreshed: ${newSet.size} paid numbers (${entry.apiGroups.join(', ')}; ₹${MIN_AMOUNT}-${MAX_AMOUNT}; last ${DAYS_BACK} days)`);
+  } else {
+    // Partial pull (a chunk errored) — merge instead of replacing, so a transient
+    // API failure can never shrink the allowlist.
+    if (!entry.paidSet) { entry.paidSet = new Set(); entry.paidInfo = {}; }
+    for (const p of newSet) entry.paidSet.add(p);
+    Object.assign(entry.paidInfo, newInfo);
+    log(`[${entry.label}] Partial refresh (${chunksOk}/${chunksTotal} chunks) — merged, now ${entry.paidSet.size} paid numbers`);
+  }
+}
+
+async function checkAndApprove(client) {
+  const approvedNames = [];
+  let stillPending = 0;
+
+  for (const entry of watched) {
+    if (!entry.groupId) continue;
+    try {
+      const requests = await client.getGroupMembershipRequests(entry.groupId);
+      if (!requests || requests.length === 0) continue;
+      log(`[${entry.label}] Pending requests: ${requests.length}`);
+
+      const toApprove = [];
+      for (const req of requests) {
+        let phone = '';
+        const wid = req.id._serialized || '';
+        if (wid.endsWith('@c.us')) {
+          phone = normalizePhone(req.id.user);
+        } else {
+          try {
+            const res = await client.pupPage.evaluate(async (uid) => {
+              try { return await window.WWebJS.enforceLidAndPnRetrieval(uid); }
+              catch (e) { return { err: e.message }; }
+            }, wid);
+            if (res && res.phone) {
+              phone = normalizePhone(res.phone.user || res.phone._serialized || String(res.phone));
+            } else if (res && res.err) {
+              log(`[${entry.label}] LID resolution error for ${wid}: ${res.err}`);
+            }
+          } catch (e) {
+            log(`[${entry.label}] Could not resolve ${wid} to a number: ${e.message}`);
+          }
+        }
+
+        let info = phone && entry.paidSet && entry.paidSet.has(phone) ? entry.paidInfo[phone] : null;
+
+        // Check if they paid with a different number (alternate number override)
+        if (!info && phone) {
+          const altRec = alternateNumbers.get(phone);
+          if (altRec) {
+            // Verify the alternate request is for the correct group/funnel
+            const reqFunnel = canonicalApiGroup(altRec.funnel);
+            const groupMatches = entry.apiGroups.some((gf) => canonicalApiGroup(gf) === reqFunnel);
+            if (groupMatches) {
+              info = { name: altRec.name, amount: '(paid via alt#)', group: altRec.group };
+              log(`[${entry.label}] Alternate number found for ${phone} (original: ${altRec.original_phone}, funnel match: ${reqFunnel})`);
+            } else {
+              log(`[${entry.label}] Alternate number ${phone} found but funnel mismatch (form: ${reqFunnel}, this group: ${entry.apiGroups.join(', ')})`);
+            }
+          }
+        }
+
+        // Cache miss on a recent request: they may have paid minutes ago, before
+        // the last list refresh. Do a targeted 2-day lookup before writing them off.
+        if (!info && phone) {
+          info = await lookupRecentPayment(entry, phone, req.t);
+          if (info) log(`[${entry.label}] Payment found on targeted lookup for ${phone} (${info.name}, ₹${info.amount})`);
+        }
+
+        if (info) {
+          toApprove.push(req.id._serialized);
+          approvedNames.push(info.name);
+          log(`[${entry.label}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${req.id.user} — ${info.name} (₹${info.amount}, ${info.group})`);
+        } else {
+          stillPending++;
+          log(`[${entry.label}] NOT PAID (leaving pending): ${req.id.user}${phone ? ` (resolved: ${phone})` : ' (number unresolved)'}`);
+        }
+      }
+
+      if (toApprove.length > 0 && !DRY_RUN) {
+        const delayS = Math.round(rand(APPROVE_DELAY_MIN_S, APPROVE_DELAY_MAX_S));
+        log(`[${entry.label}] Waiting ${delayS}s before approving ${toApprove.length}...`);
+        await sleep(delayS * 1000);
+        await client.approveGroupMembershipRequests(entry.groupId, { requesterIds: toApprove });
+        log(`[${entry.label}] Approved ${toApprove.length}/${requests.length} (${requests.length - toApprove.length} left pending)`);
+      }
+    } catch (e) {
+      log(`[${entry.label}] Error checking ${entry.groupId}: ${e.message}`);
+      // A detached frame never recovers — the page reloaded under us. Exit and let pm2 restart fresh.
+      if (String(e.message).includes('detached Frame')) {
+        log('Detached frame detected — restarting process for a clean session.');
+        process.exit(1);
+      }
+    }
+  }
+
+  const today = istDateStr();
+  if (stats.date !== today) stats = { date: today, approved: 0, pending: 0, names: [] };
+  if (!DRY_RUN) {
+    stats.approved += approvedNames.length;
+    stats.names.push(...approvedNames);
+  }
+  stats.pending = stillPending;
+  writeStatus({ lastSweepOk: true });
+}
+
+// ============ MEMBER ROSTER AUDIT ============
+// Twice a day, list every current member of every watched group and tally them
+// against payment records, so members who never paid are visible.
+// (Still uses 90-day window since old members may have paid months ago)
+
+let lidCache = {};
+function loadLidCache() {
+  try { if (fs.existsSync(LID_CACHE_FILE)) lidCache = JSON.parse(fs.readFileSync(LID_CACHE_FILE, 'utf8')); }
+  catch (e) { lidCache = {}; }
+}
+function saveLidCache() {
+  try { fs.writeFileSync(LID_CACHE_FILE, JSON.stringify(lidCache)); } catch (e) { /* best effort */ }
+}
+
+async function widToPhone(client, wid) {
+  if (lidCache[wid]) return lidCache[wid];
+  let phone = '';
+  if (wid.endsWith('@c.us')) {
+    phone = normalizePhone(wid.split('@')[0]);
+  } else {
+    try {
+      const res = await client.pupPage.evaluate(async (uid) => {
+        try { return await window.WWebJS.enforceLidAndPnRetrieval(uid); }
+        catch (e) { return null; }
+      }, wid);
+      if (res && res.phone) phone = normalizePhone(res.phone.user || res.phone._serialized || String(res.phone));
+    } catch (e) { /* leave unresolved */ }
+  }
+  if (phone) lidCache[wid] = phone;
+  return phone;
+}
+
+// Wider payment history than the approval cache — members may have paid months ago
+async function fetchPaymentHistory(entry) {
+  const map = {};
+  const today = new Date();
+  for (let start = ROSTER_DAYS_BACK; start > 0; start -= 30) {
+    const from = new Date(today); from.setDate(from.getDate() - start);
+    const to = new Date(today);   to.setDate(to.getDate() - Math.max(start - 30, 0));
+    const url = `${API_BASE}?from=${fmtDate(from)}&to=${fmtDate(to)}&group=${encodeURIComponent(entry.apiGroups.join(','))}`;
+    const data = await apiGet(url, `${entry.label} roster`);
+    if (!data) continue;
+    for (const l of data.leads || []) {
+      const phone = normalizePhone(l.whatsapp);
+      if (!phone) continue;
+      const amt = parseFloat(l.amount);
+      const paid = l.status === 'Paid' && amt >= MIN_AMOUNT && amt <= MAX_AMOUNT;
+      // A paid record always wins over an earlier form-only/failed record
+      if (paid || !map[phone]) {
+        map[phone] = { name: l.name || '', status: l.status, amount: l.amount || '', at: l.capturedAt || '', paid };
+      }
+    }
+    await sleep(1500); // stay gentle on the API
+  }
+  return map;
+}
+
+function csvCell(v) {
+  const s = String(v == null ? '' : v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+async function buildRoster(client) {
+  log('Roster audit starting — collecting members of all watched groups...');
+  loadLidCache();
+  const rows = [];
+  const summary = [];
+
+  for (const entry of watched) {
+    if (!entry.groupId) continue;
+    try {
+      let chat, participants = [];
+      try {
+        chat = await client.getChatById(entry.groupId);
+        if (!chat) throw new Error('getChatById returned null');
+        participants = chat.participants || await client.getGroupMembersIds(entry.groupId) || [];
+      } catch (e) {
+        log(`[${entry.label}] Could not get chat/members: ${e.message} — trying groupId directly`);
+        try {
+          const ids = await client.getGroupMembersIds(entry.groupId);
+          participants = ids ? ids.map((id) => ({ id: { _serialized: id } })) : [];
+        } catch (e2) {
+          log(`[${entry.label}] getGroupMembersIds also failed: ${e2.message}`);
+          continue;
+        }
+      }
+
+      const history = await fetchPaymentHistory(entry);
+      let paidCount = 0, unpaidCount = 0, unknownCount = 0;
+
+      for (const p of participants) {
+        const wid = p.id ? (p.id._serialized || p.id) : String(p);
+        const phone = await widToPhone(client, wid);
+        const rec = phone ? history[phone] : null;
+        let verdict;
+        if (!phone) { verdict = 'UNRESOLVED'; unknownCount++; }
+        else if (rec && rec.paid) { verdict = 'PAID'; paidCount++; }
+        else if (rec) { verdict = `NOT PAID (${rec.status})`; unpaidCount++; }
+        else { verdict = 'NO RECORD'; unpaidCount++; }
+
+        rows.push([
+          (chat && chat.name) || entry.label,
+          entry.apiGroups.join(' / '),
+          phone || wid,
+          rec ? rec.name : '',
+          verdict,
+          rec ? rec.amount : '',
+          rec ? rec.at : '',
+          (p.isAdmin || p.isSuperAdmin) ? 'admin' : '',
+        ]);
+      }
+      summary.push(`${(chat && chat.name) || entry.label}: ${participants.length} members — ${paidCount} paid, ${unpaidCount} not paid, ${unknownCount} unresolved`);
+      log(`[${entry.label}] Roster: ${participants.length} members (${paidCount} paid, ${unpaidCount} not paid, ${unknownCount} unresolved)`);
+    } catch (e) {
+      log(`[${entry.label}] Roster error: ${e.message}`);
+    }
+  }
+
+  saveLidCache();
+
+  const header = ['group', 'funnel', 'phone', 'name', 'payment_status', 'amount', 'paid_at', 'role'];
+  const stamp = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' }).replace(/[: ]/g, '-').slice(0, 16);
+  const csv = [header, ...rows].map((r) => r.map(csvCell).join(',')).join('\n');
+  try {
+    fs.mkdirSync(ROSTER_DIR, { recursive: true });
+    fs.writeFileSync(path.join(ROSTER_DIR, `roster-${stamp}.csv`), csv);
+    fs.writeFileSync(path.join(ROSTER_DIR, 'roster-latest.csv'), csv);
+  } catch (e) { log(`Could not write roster CSV: ${e.message}`); }
+
+  const webhookUrl = config.ROSTER_WEBHOOK_URL || getConfig('ROSTER_WEBHOOK_URL');
+  if (webhookUrl) {
+    try {
+      const resp = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ generatedAt: stamp, header, rows }),
+      });
+      log(resp.ok ? `Roster pushed to sheet (${rows.length} rows).` : `Roster webhook returned ${resp.status}`);
+    } catch (e) { log(`Roster webhook failed: ${e.message}`); }
+  } else {
+    log(`Roster saved locally (${rows.length} rows) — add ROSTER_WEBHOOK_URL to Config sheet to push it to your sheet.`);
+  }
+
+  log(`Roster audit done. ${summary.join(' | ')}`);
+  return { rows: rows.length, summary };
+}
+
+let lastRosterKey = '';
+async function maybeRunRoster(client) {
+  const h = istHour();
+  if (!ROSTER_HOURS_IST.includes(h)) return;
+  const key = `${istDateStr()}-${h}`;
+  if (lastRosterKey === key) return;
+  lastRosterKey = key;
+  try { await buildRoster(client); } catch (e) { log(`Roster audit failed: ${e.message}`); }
+}
+// ============================================
+
+const client = new Client({
+  authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wa-session') }),
+  puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+});
+
+client.on('qr', (qr) => {
+  console.log('\nScan this QR with the ADMIN number (WhatsApp > Linked Devices > Link a Device):\n');
+  qrcode.generate(qr, { small: true });
+  fs.writeFileSync(path.join(__dirname, 'latest-qr.txt'), qr);
+  // Session is gone — approvals are stopped until a human scans. watchdog.js escalates this.
+  writeStatus({ needsQrScan: true, lastSweepOk: false });
+  log('SESSION LOST — waiting for QR scan. No approvals will happen until then.');
+});
+
+client.on('authenticated', () => writeStatus({ needsQrScan: false }));
+
+// Daily summary to WhatsApp (the linked account itself unless SUMMARY_TO_NUMBER is set)
+let lastSummaryDate = '';
+async function maybeSendSummary(client) {
+  const today = istDateStr();
+  if (lastSummaryDate === today || istHour() !== SUMMARY_HOUR_IST) return;
+  if (stats.date !== today) return;
+  lastSummaryDate = today;
+  try {
+    const me = client.info && client.info.wid ? client.info.wid._serialized : null;
+    const to = SUMMARY_TO_NUMBER ? `${SUMMARY_TO_NUMBER.replace(/\D/g, '')}@c.us` : me;
+    if (!to) return;
+    const lines = [
+      `WA auto-approve — ${today}`,
+      `Approved today: ${stats.approved}`,
+      `Left pending (unpaid): ${stats.pending}`,
+      `Groups watched: ${watched.length}`,
+    ];
+    await client.sendMessage(to, lines.join('\n'));
+    log(`Daily summary sent (${stats.approved} approved, ${stats.pending} pending).`);
+  } catch (e) {
+    log(`Could not send daily summary: ${e.message}`);
+  }
+}
+
+async function checkLoop(client) {
+  if (isNight()) {
+    if (!nightLogged) { log(`Night pause (IST ${NIGHT_START_HOUR}:00-${NIGHT_END_HOUR}:00) — no activity until morning.`); nightLogged = true; }
+  } else {
+    nightLogged = false;
+    try { await checkAndApprove(client); } catch (e) { log(`Check sweep error: ${e.message}`); }
+    await maybeSendSummary(client);
+    await maybeRunRoster(client);
+  }
+  writeStatus();
+  setTimeout(() => checkLoop(client), rand(CHECK_MIN_MINUTES, CHECK_MAX_MINUTES) * 60 * 1000);
+}
+
+async function refreshLoop(client) {
+  if (!isNight()) {
+    try {
+      await syncConfigSheet();    // Load credentials from Config sheet (GROWTHX_API_KEY, Telegram, etc.)
+      await syncConfig();         // Load groups from Groups sheet
+      await syncAlternateNumbers();
+      await resolveGroups(client);
+      for (const entry of watched) await refreshPaidListFor(entry);
+      savePaidCache();
+    } catch (e) { log(`Refresh error: ${e.message}`); }
+  }
+  writeStatus();
+  setTimeout(() => refreshLoop(client), rand(REFRESH_MIN_MINUTES, REFRESH_MAX_MINUTES) * 60 * 1000);
+}
+
+let started = false;
+client.on('ready', async () => {
+  log(`WhatsApp client ready.${DRY_RUN ? ' (DRY RUN mode)' : ''}${GROUPS_SHEET_CSV_URL ? ' Config: Google Sheet' : ' Config: built-in list'}`);
+  if (started) return; // 'ready' can re-fire on page reloads — don't stack duplicate loops
+  started = true;
+  await sleep(10000); // let the chat store finish loading
+
+  await syncConfigSheet();     // Load all credentials from Config sheet
+  await syncConfig();
+  await syncAlternateNumbers();
+  loadPaidCache();          // warm start — usable allowlist before the first API pull
+  await resolveGroups(client);
+  await checkAndApprove(client);   // act on anything queued while we were down
+  for (const entry of watched) await refreshPaidListFor(entry);
+  savePaidCache();
+  await checkAndApprove(client);
+
+  if (process.env.ROSTER_NOW) {
+    log('ROSTER_NOW set — running a one-off roster audit.');
+    await buildRoster(client);
+  }
+
+  setTimeout(() => checkLoop(client), rand(CHECK_MIN_MINUTES, CHECK_MAX_MINUTES) * 60 * 1000);
+  setTimeout(() => refreshLoop(client), rand(REFRESH_MIN_MINUTES, REFRESH_MAX_MINUTES) * 60 * 1000);
+  log(`Live: ${watched.length} groups; sweeps every ${CHECK_MIN_MINUTES}-${CHECK_MAX_MINUTES} min (jittered), refresh every ${REFRESH_MIN_MINUTES}-${REFRESH_MAX_MINUTES} min, quiet ${NIGHT_START_HOUR}:00-${NIGHT_END_HOUR}:00 IST.`);
+});
+
+client.on('disconnected', (reason) => {
+  log(`WhatsApp disconnected: ${reason}. Exiting — process manager will restart.`);
+  process.exit(1);
+});
+
+client.initialize();
