@@ -454,6 +454,7 @@ async function syncConfig() {
         const linkCol = findCol('invite', 'link');
         const labelCol = findCol('label');
         const activeCol = findCol('active');
+        const numCol = findCol('number'); // "whatsapp Group number" column
         if (groupCol === -1 || linkCol === -1) {
           log('Sheet missing a group or invite-link column — using fallback config');
           return;
@@ -465,6 +466,7 @@ async function syncConfig() {
             label: ((labelCol !== -1 && r[labelCol]) || r[groupCol] || '').trim(),
             inviteLink: r[linkCol].trim(),
             apiGroups: (r[groupCol] || '').split(',').map(canonicalApiGroup).filter(Boolean),
+            groupNumber: numCol !== -1 ? String(r[numCol] || '').trim() : '',
           }))
           .filter((e) => e.apiGroups.length);
         if (parsed.length) desired = parsed;
@@ -482,7 +484,7 @@ async function syncConfig() {
   const prev = new Map(watched.map((e) => [e.inviteLink, e]));
   watched = desired.map((d) => {
     const old = prev.get(d.inviteLink);
-    return old ? Object.assign(old, { label: d.label, apiGroups: d.apiGroups }) : { ...d };
+    return old ? Object.assign(old, { label: d.label, apiGroups: d.apiGroups, groupNumber: d.groupNumber }) : { ...d };
   });
 }
 
@@ -650,12 +652,12 @@ async function checkAndApprove(client) {
           if (info) method = 'name-match-growthx';
         }
 
-        const groupName = entry.groupName || entry.groupId || '';
+        const groupNo = entry.groupNumber || entry.groupName || '';
         if (info) {
           toApprove.push(req.id._serialized);
           approvedNames.push(info.name);
-          postToSheet({ type: 'approval', row: [new Date().toISOString(), entry.label, groupName, info.name, phone || req.id.user, String(info.amount), info.group, method] });
-          log(`[${entry.label}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${req.id.user} — ${info.name} (₹${info.amount}, ${info.group}) [${method}]`);
+          postToSheet({ type: 'approval', row: [new Date().toISOString(), entry.label, groupNo, info.name, phone || req.id.user, String(info.amount), info.group, method] });
+          log(`[${entry.label} #${groupNo}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${phone || req.id.user} — ${info.name} (₹${info.amount}, ${info.group}) [${method}]`);
         } else {
           stillPending++;
           // Report each pending person to the sheet once per day (sweeps repeat
@@ -663,9 +665,9 @@ async function checkAndApprove(client) {
           const pKey = `${entry.label}|${phone || req.id.user}|${istDateStr()}`;
           if (!pendingReported.has(pKey)) {
             pendingReported.add(pKey);
-            postToSheet({ type: 'pending', row: [new Date().toISOString(), entry.label, groupName, '', phone || req.id.user, '', '', 'no payment found (₹100-300)'] });
+            postToSheet({ type: 'pending', row: [new Date().toISOString(), entry.label, groupNo, '', phone || req.id.user, '', '', 'no payment found (₹100-300)'] });
           }
-          log(`[${entry.label}] NOT PAID (leaving pending): ${req.id.user}${phone ? ` (resolved: ${phone})` : ' (number unresolved)'}`);
+          log(`[${entry.label} #${groupNo}] NOT PAID (leaving pending): ${phone || req.id.user}${phone ? '' : ' (number unresolved)'}`);
         }
       }
 
