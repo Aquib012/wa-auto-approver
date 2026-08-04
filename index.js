@@ -93,7 +93,8 @@ const SUMMARY_HOUR_IST = 21;
 const ROSTER_HOURS_IST = [10, 19];     // runs once per listed hour, per day
 const ROSTER_DAYS_BACK = 90;           // wider window — members may have paid months ago
 // Apps Script web-app URL that appends rows to your sheet (see roster-appscript.gs).
-const ROSTER_WEBHOOK_URL = '';
+// One URL handles everything: logs, approvals, alternate approvals, roster.
+const ROSTER_WEBHOOK_URL = process.env.SHEET_WEBHOOK_URL || '';
 
 const LOG_FILE = path.join(__dirname, 'approvals.log');
 const STATUS_FILE = path.join(__dirname, 'status.json');   // heartbeat for watchdog.js
@@ -108,10 +109,37 @@ const freshCheckedAt = new Map();  // "label|phone" -> ms of last targeted looku
 let stats = { date: '', approved: 0, pending: 0, names: [] };
 let alternateNumbers = new Map();  // alternate_phone -> {original_phone, name, group, funnel}
 
+// ---- Google Sheet logging ----
+// Every log line is buffered and flushed to the Apps Script webhook once a
+// minute, so the sheet is the primary log store (local file kept as backup).
+const sheetLogBuffer = [];
+
+async function postToSheet(payload) {
+  if (!ROSTER_WEBHOOK_URL) return;
+  try {
+    await fetch(ROSTER_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      redirect: 'follow',
+    });
+  } catch (e) {
+    console.log(`(sheet webhook post failed: ${e.message})`);
+  }
+}
+
+setInterval(() => {
+  if (sheetLogBuffer.length === 0) return;
+  const lines = sheetLogBuffer.splice(0, sheetLogBuffer.length);
+  postToSheet({ type: 'logs', lines });
+}, 60 * 1000);
+
 function log(msg) {
-  const line = `[${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}] ${msg}`;
+  const ts = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+  const line = `[${ts}] ${msg}`;
   console.log(line);
-  fs.appendFileSync(LOG_FILE, line + '\n');
+  try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch {}
+  sheetLogBuffer.push([ts, msg]);
 }
 
 function normalizePhone(raw) {
@@ -250,11 +278,14 @@ let usedPaidForName = {};
 try { usedPaidForName = JSON.parse(fs.readFileSync(NAME_APPROVALS_FILE, 'utf8')); } catch {}
 
 function recordAltApproval(rec) {
+  const row = [new Date().toISOString(), rec.group, rec.requesterPhone, rec.name, rec.paidPhone, rec.amount, rec.funnel, rec.method];
   const header = 'timestamp,group,requester_phone,matched_name,paid_phone,amount,funnel,method\n';
-  if (!fs.existsSync(ALT_APPROVALS_CSV)) fs.writeFileSync(ALT_APPROVALS_CSV, header);
-  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  fs.appendFileSync(ALT_APPROVALS_CSV,
-    [new Date().toISOString(), rec.group, rec.requesterPhone, rec.name, rec.paidPhone, rec.amount, rec.funnel, rec.method].map(esc).join(',') + '\n');
+  try {
+    if (!fs.existsSync(ALT_APPROVALS_CSV)) fs.writeFileSync(ALT_APPROVALS_CSV, header);
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    fs.appendFileSync(ALT_APPROVALS_CSV, row.map(esc).join(',') + '\n');
+  } catch {}
+  postToSheet({ type: 'alt_approval', row });
 }
 
 const normName = (s) => String(s || '').toLowerCase().replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
@@ -616,6 +647,7 @@ async function checkAndApprove(client) {
         if (info) {
           toApprove.push(req.id._serialized);
           approvedNames.push(info.name);
+          postToSheet({ type: 'approval', row: [new Date().toISOString(), entry.label, info.name, phone || req.id.user, String(info.amount), info.group] });
           log(`[${entry.label}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${req.id.user} — ${info.name} (₹${info.amount}, ${info.group})`);
         } else {
           stillPending++;
