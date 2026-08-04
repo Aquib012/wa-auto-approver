@@ -237,6 +237,74 @@ async function lookupRecentPayment(entry, phone, requestUnixTime) {
   return null;
 }
 
+// ---- Name-based fallback (paid with a different number, no form filled) ----
+// If the requester's number has no payment, compare their WhatsApp profile name
+// against paid leads in this group's funnel from the last 2 days. Requires an
+// exact, UNIQUE full-name match. Each paid record can only ever approve one
+// requester this way (tracked in name-approvals.json) so one payment can't
+// admit multiple numbers. Every such approval is recorded in
+// alternate-approvals.csv for audit.
+const NAME_APPROVALS_FILE = path.join(__dirname, 'name-approvals.json');
+const ALT_APPROVALS_CSV = path.join(__dirname, 'alternate-approvals.csv');
+let usedPaidForName = {};
+try { usedPaidForName = JSON.parse(fs.readFileSync(NAME_APPROVALS_FILE, 'utf8')); } catch {}
+
+function recordAltApproval(rec) {
+  const header = 'timestamp,group,requester_phone,matched_name,paid_phone,amount,funnel,method\n';
+  if (!fs.existsSync(ALT_APPROVALS_CSV)) fs.writeFileSync(ALT_APPROVALS_CSV, header);
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  fs.appendFileSync(ALT_APPROVALS_CSV,
+    [new Date().toISOString(), rec.group, rec.requesterPhone, rec.name, rec.paidPhone, rec.amount, rec.funnel, rec.method].map(esc).join(',') + '\n');
+}
+
+const normName = (s) => String(s || '').toLowerCase().replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
+
+async function lookupByName(client, entry, req, phone) {
+  const key = `name|${entry.label}|${phone}`;
+  const last = freshCheckedAt.get(key) || 0;
+  if (Date.now() - last < FRESH_CHECK_COOLDOWN_MIN * 60 * 1000) return null;
+  freshCheckedAt.set(key, Date.now());
+
+  let waName = '';
+  try {
+    const contact = await client.getContactById(req.id._serialized);
+    waName = normName(contact && (contact.pushname || contact.name || contact.verifiedName));
+  } catch { /* contact not fetchable — skip */ }
+  // Single-word names are too risky for identity matching — require full name.
+  if (!waName || waName.split(' ').length < 2) return null;
+
+  const anchor = req.t ? new Date(req.t * 1000) : new Date();
+  const from = new Date(anchor); from.setDate(from.getDate() - 1);
+  const to = new Date();
+  const url = `${API_BASE}?from=${fmtDate(from)}&to=${fmtDate(to)}&group=${encodeURIComponent(entry.apiGroups.join(','))}`;
+  const data = await apiGet(url, entry.label);
+  if (!data) return null;
+
+  const matches = [];
+  for (const l of data.leads || []) {
+    const amt = parseFloat(l.amount);
+    if (l.status === 'Paid' && amt >= config.MIN_AMOUNT && amt <= config.MAX_AMOUNT && normName(l.name) === waName) {
+      matches.push(l);
+    }
+  }
+  if (matches.length !== 1) {
+    if (matches.length > 1) log(`[${entry.label}] Name "${waName}" matches ${matches.length} paid leads — ambiguous, leaving pending`);
+    return null;
+  }
+  const lead = matches[0];
+  const paidPhone = normalizePhone(lead.whatsapp);
+  // If the paid number is the requester itself, the phone check would have caught it.
+  if (usedPaidForName[paidPhone] && usedPaidForName[paidPhone] !== phone) {
+    log(`[${entry.label}] Name match for ${phone} → paid record ${paidPhone} already used to approve ${usedPaidForName[paidPhone]} — skipping`);
+    return null;
+  }
+  usedPaidForName[paidPhone] = phone;
+  try { fs.writeFileSync(NAME_APPROVALS_FILE, JSON.stringify(usedPaidForName, null, 2)); } catch {}
+  recordAltApproval({ group: entry.label, requesterPhone: phone, name: lead.name, paidPhone, amount: lead.amount, funnel: lead.group, method: 'name-match' });
+  log(`[${entry.label}] NAME MATCH: requester ${phone} = "${lead.name}" who paid via different number ${paidPhone} (₹${lead.amount})`);
+  return { name: lead.name, amount: `${lead.amount} (via alt# ${paidPhone})`, group: lead.group };
+}
+
 // Minimal CSV parser (handles quoted fields with commas)
 function parseCsv(text) {
   const rows = [];
@@ -523,6 +591,7 @@ async function checkAndApprove(client) {
             const groupMatches = entry.apiGroups.some((gf) => canonicalApiGroup(gf) === reqFunnel);
             if (groupMatches) {
               info = { name: altRec.name, amount: '(paid via alt#)', group: altRec.group };
+              recordAltApproval({ group: entry.label, requesterPhone: phone, name: altRec.name, paidPhone: altRec.original_phone, amount: '', funnel: altRec.funnel, method: 'alt-sheet' });
               log(`[${entry.label}] Alternate number found for ${phone} (original: ${altRec.original_phone}, funnel match: ${reqFunnel})`);
             } else {
               log(`[${entry.label}] Alternate number ${phone} found but funnel mismatch (form: ${reqFunnel}, this group: ${entry.apiGroups.join(', ')})`);
@@ -535,6 +604,13 @@ async function checkAndApprove(client) {
         if (!info && phone) {
           info = await lookupRecentPayment(entry, phone, req.t);
           if (info) log(`[${entry.label}] Payment found on targeted lookup for ${phone} (${info.name}, ₹${info.amount})`);
+        }
+
+        // Last resort: paid under a different number and never filled the form?
+        // Match the requester's WhatsApp profile name against the last 2 days of
+        // paid leads in this group's funnel (exact, unique full-name match only).
+        if (!info && phone) {
+          info = await lookupByName(client, entry, req, phone);
         }
 
         if (info) {
