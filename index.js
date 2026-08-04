@@ -449,6 +449,32 @@ async function refreshPaidListFor(entry) {
   }
 }
 
+// Fast same-day + yesterday pull for one group. Most join requests come from
+// people who paid today or yesterday, so this small 2-day fetch runs right
+// before processing a group's pending requests — new payments land in the
+// allowlist immediately instead of waiting for the next full 14-day refresh.
+async function quickRefreshRecent(entry) {
+  const today = new Date();
+  const from = new Date(today); from.setDate(from.getDate() - 1); // yesterday
+  const url = `${API_BASE}?from=${fmtDate(from)}&to=${fmtDate(today)}&group=${encodeURIComponent(entry.apiGroups.join(','))}`;
+  const data = await apiGet(url, entry.label);
+  if (!data) return;
+  if (!entry.paidSet) { entry.paidSet = new Set(); entry.paidInfo = {}; }
+  let added = 0;
+  for (const l of data.leads || []) {
+    const amt = parseFloat(l.amount);
+    if (l.status === 'Paid' && amt >= config.MIN_AMOUNT && amt <= config.MAX_AMOUNT) {
+      const phone = normalizePhone(l.whatsapp);
+      if (phone && !entry.paidSet.has(phone)) {
+        entry.paidSet.add(phone);
+        entry.paidInfo[phone] = { name: l.name, amount: l.amount, group: l.group };
+        added++;
+      }
+    }
+  }
+  if (added > 0) log(`[${entry.label}] Quick refresh: ${added} new paid number(s) from today/yesterday`);
+}
+
 async function checkAndApprove(client) {
   const approvedNames = [];
   let stillPending = 0;
@@ -459,6 +485,10 @@ async function checkAndApprove(client) {
       const requests = await client.getGroupMembershipRequests(entry.groupId);
       if (!requests || requests.length === 0) continue;
       log(`[${entry.label}] Pending requests: ${requests.length}`);
+
+      // Priority order: same-day/yesterday payments first (fetched fresh here),
+      // then alternate-number match, then targeted lookup, then 14-day cache.
+      await quickRefreshRecent(entry);
 
       const toApprove = [];
       for (const req of requests) {
