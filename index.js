@@ -226,7 +226,7 @@ async function lookupRecentPayment(entry, phone, requestUnixTime) {
 
   for (const l of data.leads || []) {
     const amt = parseFloat(l.amount);
-    if (l.status === 'Paid' && amt >= MIN_AMOUNT && amt <= MAX_AMOUNT && normalizePhone(l.whatsapp) === phone) {
+    if (l.status === 'Paid' && amt >= config.MIN_AMOUNT && amt <= config.MAX_AMOUNT && normalizePhone(l.whatsapp) === phone) {
       const info = { name: l.name, amount: l.amount, group: l.group };
       if (!entry.paidSet) { entry.paidSet = new Set(); entry.paidInfo = {}; }
       entry.paidSet.add(phone);
@@ -407,7 +407,7 @@ async function refreshPaidListFor(entry) {
   const groupFilter = encodeURIComponent(entry.apiGroups.join(','));
 
   let chunksOk = 0, chunksTotal = 0;
-  for (let start = DAYS_BACK; start > 0; start -= 7) {
+  for (let start = config.DAYS_BACK; start > 0; start -= 7) {
     chunksTotal++;
     const from = new Date(today); from.setDate(from.getDate() - start);
     const to = new Date(today);   to.setDate(to.getDate() - Math.max(start - 7, 0));
@@ -419,7 +419,7 @@ async function refreshPaidListFor(entry) {
       for (const l of data.leads || []) {
         const amt = parseFloat(l.amount);
         // HARD RULE: only successful payments count — never Form only/Expired/Failed
-        if (l.status === 'Paid' && amt >= MIN_AMOUNT && amt <= MAX_AMOUNT) {
+        if (l.status === 'Paid' && amt >= config.MIN_AMOUNT && amt <= config.MAX_AMOUNT) {
           const phone = normalizePhone(l.whatsapp);
           if (phone) {
             newSet.add(phone);
@@ -438,7 +438,7 @@ async function refreshPaidListFor(entry) {
   if (chunksOk === chunksTotal) {
     entry.paidSet = newSet;
     entry.paidInfo = newInfo;
-    log(`[${entry.label}] Paid list refreshed: ${newSet.size} paid numbers (${entry.apiGroups.join(', ')}; ₹${MIN_AMOUNT}-${MAX_AMOUNT}; last ${DAYS_BACK} days)`);
+    log(`[${entry.label}] Paid list refreshed: ${newSet.size} paid numbers (${entry.apiGroups.join(', ')}; ₹${config.MIN_AMOUNT}-${config.MAX_AMOUNT}; last ${config.DAYS_BACK} days)`);
   } else {
     // Partial pull (a chunk errored) — merge instead of replacing, so a transient
     // API failure can never shrink the allowlist.
@@ -590,7 +590,7 @@ async function fetchPaymentHistory(entry) {
       const phone = normalizePhone(l.whatsapp);
       if (!phone) continue;
       const amt = parseFloat(l.amount);
-      const paid = l.status === 'Paid' && amt >= MIN_AMOUNT && amt <= MAX_AMOUNT;
+      const paid = l.status === 'Paid' && amt >= config.MIN_AMOUNT && amt <= config.MAX_AMOUNT;
       // A paid record always wins over an earlier form-only/failed record
       if (paid || !map[phone]) {
         map[phone] = { name: l.name || '', status: l.status, amount: l.amount || '', at: l.capturedAt || '', paid };
