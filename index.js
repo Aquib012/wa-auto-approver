@@ -911,6 +911,24 @@ async function checkLoop(client) {
   setTimeout(() => checkLoop(client), rand(CHECK_MIN_MINUTES, CHECK_MAX_MINUTES) * 60 * 1000);
 }
 
+// Refresh paid lists once per unique funnel-set — groups watching the same
+// funnel (e.g. SQE 5 + SQE 6) share one API pull and one in-memory list,
+// halving API calls and avoiding 429 rate limits.
+async function refreshAllPaidLists() {
+  const byFunnel = new Map();
+  for (const entry of watched) {
+    const key = entry.apiGroups.join(',');
+    const src = byFunnel.get(key);
+    if (src) {
+      entry.paidSet = src.paidSet;
+      entry.paidInfo = src.paidInfo;
+    } else {
+      await refreshPaidListFor(entry);
+      byFunnel.set(key, entry);
+    }
+  }
+}
+
 async function refreshLoop(client) {
   if (!isNight()) {
     try {
@@ -918,7 +936,7 @@ async function refreshLoop(client) {
       await syncConfig();         // Load groups from Groups sheet
       await syncAlternateNumbers();
       await resolveGroups(client);
-      for (const entry of watched) await refreshPaidListFor(entry);
+      await refreshAllPaidLists();
       savePaidCache();
     } catch (e) { log(`Refresh error: ${e.message}`); }
   }
@@ -939,7 +957,7 @@ client.on('ready', async () => {
   loadPaidCache();          // warm start — usable allowlist before the first API pull
   await resolveGroups(client);
   await checkAndApprove(client);   // act on anything queued while we were down
-  for (const entry of watched) await refreshPaidListFor(entry);
+  await refreshAllPaidLists();
   savePaidCache();
   await checkAndApprove(client);
 
