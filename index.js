@@ -5,6 +5,7 @@
 // - Human-like behavior: jittered intervals, night pause (IST), delayed approvals.
 // - Unpaid requests are left pending for manual review.
 
+try { require('dotenv').config(); } catch { /* dotenv optional — env vars may be set directly */ }
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
