@@ -109,6 +109,7 @@ let nightLogged = false;
 const freshCheckedAt = new Map();  // "label|phone" -> ms of last targeted lookup
 let stats = { date: '', approved: 0, pending: 0, names: [] };
 let alternateNumbers = new Map();  // alternate_phone -> {original_phone, name, group, funnel}
+const pendingReported = new Set(); // "label|phone|date" — pending rows already sent to the sheet today
 
 // ---- Google Sheet logging ----
 // Every log line is buffered and flushed to the Apps Script webhook once a
@@ -493,6 +494,7 @@ async function resolveGroups(client) {
     try {
       const info = await client.getInviteInfo(code.replace(/[/?#].*$/, ''));
       entry.groupId = info.id._serialized || `${info.id.user}@g.us`;
+      entry.groupName = info.subject || '';
       log(`[${entry.label}] Resolved "${info.subject}" -> ${entry.groupId}`);
     } catch (e) {
       log(`[${entry.label}] Failed to resolve invite link: ${e.message}`);
@@ -612,6 +614,7 @@ async function checkAndApprove(client) {
           }
         }
 
+        let method = 'number-match';
         let info = phone && entry.paidSet && entry.paidSet.has(phone) ? entry.paidInfo[phone] : null;
 
         // Check if they paid with a different number (alternate number override)
@@ -623,6 +626,7 @@ async function checkAndApprove(client) {
             const groupMatches = entry.apiGroups.some((gf) => canonicalApiGroup(gf) === reqFunnel);
             if (groupMatches) {
               info = { name: altRec.name, amount: '(paid via alt#)', group: altRec.group };
+              method = 'alternate-number-form';
               recordAltApproval({ group: entry.label, requesterPhone: phone, name: altRec.name, paidPhone: altRec.original_phone, amount: '', funnel: altRec.funnel, method: 'alt-sheet' });
               log(`[${entry.label}] Alternate number found for ${phone} (original: ${altRec.original_phone}, funnel match: ${reqFunnel})`);
             } else {
@@ -635,7 +639,7 @@ async function checkAndApprove(client) {
         // the last list refresh. Do a targeted 2-day lookup before writing them off.
         if (!info && phone) {
           info = await lookupRecentPayment(entry, phone, req.t);
-          if (info) log(`[${entry.label}] Payment found on targeted lookup for ${phone} (${info.name}, ₹${info.amount})`);
+          if (info) { method = 'number-match'; log(`[${entry.label}] Payment found on targeted lookup for ${phone} (${info.name}, ₹${info.amount})`); }
         }
 
         // Last resort: paid under a different number and never filled the form?
@@ -643,15 +647,24 @@ async function checkAndApprove(client) {
         // paid leads in this group's funnel (exact, unique full-name match only).
         if (!info && phone) {
           info = await lookupByName(client, entry, req, phone);
+          if (info) method = 'name-match-growthx';
         }
 
+        const groupName = entry.groupName || entry.groupId || '';
         if (info) {
           toApprove.push(req.id._serialized);
           approvedNames.push(info.name);
-          postToSheet({ type: 'approval', row: [new Date().toISOString(), entry.label, info.name, phone || req.id.user, String(info.amount), info.group] });
-          log(`[${entry.label}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${req.id.user} — ${info.name} (₹${info.amount}, ${info.group})`);
+          postToSheet({ type: 'approval', row: [new Date().toISOString(), entry.label, groupName, info.name, phone || req.id.user, String(info.amount), info.group, method] });
+          log(`[${entry.label}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${req.id.user} — ${info.name} (₹${info.amount}, ${info.group}) [${method}]`);
         } else {
           stillPending++;
+          // Report each pending person to the sheet once per day (sweeps repeat
+          // every few minutes — without this the tab would fill with duplicates).
+          const pKey = `${entry.label}|${phone || req.id.user}|${istDateStr()}`;
+          if (!pendingReported.has(pKey)) {
+            pendingReported.add(pKey);
+            postToSheet({ type: 'pending', row: [new Date().toISOString(), entry.label, groupName, '', phone || req.id.user, '', '', 'no payment found (₹100-300)'] });
+          }
           log(`[${entry.label}] NOT PAID (leaving pending): ${req.id.user}${phone ? ` (resolved: ${phone})` : ' (number unresolved)'}`);
         }
       }
@@ -680,6 +693,8 @@ async function checkAndApprove(client) {
     stats.names.push(...approvedNames);
   }
   stats.pending = stillPending;
+  // One row per day in the sheet, updated in place after every sweep.
+  postToSheet({ type: 'daily', row: [stats.date, stats.approved, stats.pending, stats.names.join(', ')] });
   writeStatus({ lastSweepOk: true });
 }
 

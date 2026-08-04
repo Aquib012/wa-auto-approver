@@ -25,9 +25,10 @@ function getOrCreate_(ss, name, header) {
   var sheet = ss.getSheetByName(name);
   if (!sheet) {
     sheet = ss.insertSheet(name);
-    sheet.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
     sheet.setFrozenRows(1);
   }
+  // Always refresh the header row so new columns appear automatically.
+  sheet.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
   return sheet;
 }
 
@@ -53,9 +54,35 @@ function doPost(e) {
     // --- One row per approved member ---
     if (type === 'approval') {
       var apSheet = getOrCreate_(ss, 'Approvals',
-        ['timestamp', 'group', 'name', 'phone', 'amount', 'funnel']);
+        ['timestamp', 'group', 'group_name', 'name', 'phone', 'amount', 'funnel', 'method']);
       apSheet.appendRow(payload.row);
       return ok_({ appended: 1 });
+    }
+
+    // --- One row per pending (not approved) requester, once per day ---
+    if (type === 'pending') {
+      var pdSheet = getOrCreate_(ss, 'Pending',
+        ['timestamp', 'group', 'group_name', 'name', 'phone', 'amount', 'funnel', 'status']);
+      pdSheet.appendRow(payload.row);
+      return ok_({ appended: 1 });
+    }
+
+    // --- Daily summary: one row per date, updated in place after every sweep ---
+    if (type === 'daily') {
+      var dySheet = getOrCreate_(ss, 'Daily_Summary',
+        ['date', 'approved_today', 'pending_now', 'approved_names']);
+      var dateVal = String(payload.row[0]);
+      var lastRow = dySheet.getLastRow();
+      var target = -1;
+      if (lastRow > 1) {
+        var dates = dySheet.getRange(2, 1, lastRow - 1, 1).getValues();
+        for (var i = 0; i < dates.length; i++) {
+          if (String(dates[i][0]) === dateVal) { target = i + 2; break; }
+        }
+      }
+      if (target === -1) target = lastRow + 1;
+      dySheet.getRange(target, 1, 1, payload.row.length).setValues([payload.row]);
+      return ok_({ updatedRow: target });
     }
 
     // --- Alternate-number / name-match approvals (audit trail) ---
