@@ -797,8 +797,8 @@ async function checkAndApprove(client) {
   }
   stats.pending = stillPending;
   try { fs.writeFileSync(STATS_FILE, JSON.stringify(stats)); } catch {}
-  // One row per day in the sheet, updated in place after every sweep.
-  postToSheet({ type: 'daily', row: [stats.date, stats.approved, stats.pending, stats.names.join(', ')] });
+  // Daily_Summary tab removed by user preference — the Approvals tab is the
+  // source of truth for daily counts (filter by date).
   writeStatus({ lastSweepOk: true });
 }
 
