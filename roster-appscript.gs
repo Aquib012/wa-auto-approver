@@ -67,6 +67,24 @@ function doPost(e) {
       return ok_({ appended: 1 });
     }
 
+    // --- Mark earlier Pending rows APPROVED once the person gets in ---
+    if (type === 'pending_resolve') {
+      var prSheet = ss.getSheetByName('Pending');
+      var updated = 0;
+      if (prSheet && prSheet.getLastRow() > 1) {
+        var data = prSheet.getRange(2, 1, prSheet.getLastRow() - 1, 8).getValues();
+        for (var j = 0; j < data.length; j++) {
+          if (String(data[j][4]) === String(payload.phone) &&
+              String(data[j][1]) === String(payload.group) &&
+              String(data[j][7]).indexOf('no payment') === 0) {
+            prSheet.getRange(j + 2, 8).setValue('APPROVED ✓ (' + (payload.method || '') + ')');
+            updated++;
+          }
+        }
+      }
+      return ok_({ updated: updated });
+    }
+
     // --- Daily summary: one row per date, updated in place after every sweep ---
     if (type === 'daily') {
       var dySheet = getOrCreate_(ss, 'Daily_Summary',

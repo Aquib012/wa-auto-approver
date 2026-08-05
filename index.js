@@ -693,6 +693,8 @@ async function checkAndApprove(client) {
           toApprove.push(req.id._serialized);
           approvedNames.push(info.name);
           postToSheet({ type: 'approval', row: [new Date().toISOString(), entry.label, groupNo, info.name, phone || req.id.user, String(info.amount), info.group, method] });
+          // If they were reported in the Pending tab earlier, mark that row APPROVED.
+          postToSheet({ type: 'pending_resolve', phone: phone || req.id.user, group: entry.label, method });
           log(`[${entry.label} #${groupNo}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${phone || req.id.user} — ${info.name} (₹${info.amount}, ${info.group}) [${method}]`);
         } else {
           stillPending++;
