@@ -978,17 +978,46 @@ async function maybeSendSummary(client) {
   }
 }
 
+// Prevent two sweeps running at once (regular loop + fast alt-form watcher).
+let sweeping = false;
+async function safeSweep(client) {
+  if (sweeping) return;
+  sweeping = true;
+  try { await checkAndApprove(client); }
+  finally { sweeping = false; }
+}
+
 async function checkLoop(client) {
   if (isNight()) {
     if (!nightLogged) { log(`Night pause (IST ${NIGHT_START_HOUR}:00-${NIGHT_END_HOUR}:00) — no activity until morning.`); nightLogged = true; }
   } else {
     nightLogged = false;
-    try { await checkAndApprove(client); } catch (e) { log(`Check sweep error: ${e.message}`); }
+    try { await safeSweep(client); } catch (e) { log(`Check sweep error: ${e.message}`); }
     await maybeSendSummary(client);
     await maybeRunRoster(client);
   }
   writeStatus();
   setTimeout(() => checkLoop(client), rand(CHECK_MIN_MINUTES, CHECK_MAX_MINUTES) * 60 * 1000);
+}
+
+// Fast alternate-form watcher: learners fill the form right after our AiSensy
+// nudge, so poll the form every 60s and sweep IMMEDIATELY when a new entry
+// appears — approval lands ~1-2 min after form submission instead of waiting
+// for the next scheduled sweep. Cheap: one Google CSV fetch per minute.
+let lastAltSignature = '';
+function startAltWatcher(client) {
+  setInterval(async () => {
+    if (isNight() || sweeping) return;
+    try {
+      await syncAlternateNumbers();
+      const sig = [...alternateNumbers.keys()].sort().join(',');
+      if (lastAltSignature && sig !== lastAltSignature) {
+        log('New alternate-form entry detected — running immediate sweep.');
+        await safeSweep(client);
+      }
+      lastAltSignature = sig;
+    } catch { /* transient fetch issue — next minute retries */ }
+  }, 60 * 1000);
 }
 
 // Refresh paid lists once per unique funnel-set — groups watching the same
@@ -1071,6 +1100,7 @@ client.on('ready', async () => {
 
   setTimeout(() => checkLoop(client), rand(CHECK_MIN_MINUTES, CHECK_MAX_MINUTES) * 60 * 1000);
   setTimeout(() => refreshLoop(client), rand(REFRESH_MIN_MINUTES, REFRESH_MAX_MINUTES) * 60 * 1000);
+  startAltWatcher(client);
   log(`Live: ${watched.length} groups; sweeps every ${CHECK_MIN_MINUTES}-${CHECK_MAX_MINUTES} min (jittered), refresh every ${REFRESH_MIN_MINUTES}-${REFRESH_MAX_MINUTES} min, quiet ${NIGHT_START_HOUR}:00-${NIGHT_END_HOUR}:00 IST.`);
 });
 
