@@ -490,8 +490,10 @@ async function syncAlternateNumbers() {
     });
 
     if (newMap.size > 0) {
+      const changed = newMap.size !== alternateNumbers.size;
       alternateNumbers = newMap;
-      log(`Alternate numbers sheet (${allowedMonths.join(' + ')}): ${newMap.size} alternate→original mappings loaded`);
+      // The 60s watcher calls this every minute — only log when something changed.
+      if (changed) log(`Alternate numbers sheet (${allowedMonths.join(' + ')}): ${newMap.size} alternate→original mappings loaded`);
     }
   } catch (e) {
     log(`Alternate numbers sheet fetch failed: ${e.message}`);
