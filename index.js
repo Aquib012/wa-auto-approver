@@ -654,6 +654,12 @@ async function quickRefreshRecent(entry) {
 }
 
 async function checkAndApprove(client) {
+  // Refresh the alternate-number form on every sweep — pending learners get
+  // our AiSensy nudge and fill the form; this approves them within one sweep
+  // (3-7 min) instead of waiting for the 12-18 min config refresh. It is a
+  // single lightweight Google CSV fetch, no GrowthX API cost.
+  try { await syncAlternateNumbers(); } catch { /* keep last known map */ }
+
   const approvedNames = [];
   let stillPending = 0;
 
