@@ -62,6 +62,30 @@ function canonicalApiGroup(name) {
   return API_GROUP_ALIASES[k] || String(name).trim();
 }
 
+// Does an alternate-form record belong to this WhatsApp group?
+// Form answers are messy composites like "63/CRIMINAL/LITIGATION",
+// "10/M&A/Community/Apr/26", "33/AI For Women Program", or free text like
+// "21 days contract drafting workshop". Match by (a) leading group number
+// against the sheet's whatsapp Group number, then (b) cleaned text against
+// the funnel aliases.
+function altMatchesEntry(entry, altRec) {
+  const texts = [altRec.funnel, altRec.group].filter(Boolean);
+  for (const t of texts) {
+    // (a) leading group number, e.g. "63/..." or "63 - ..."
+    const numM = String(t).match(/^\s*(\d{1,3})\s*[\/\-:.]/);
+    if (numM && entry.groupNumber && String(entry.groupNumber).split('/').includes(numM[1])) return true;
+    // (b) cleaned text → funnel alias
+    const cleaned = String(t).toLowerCase()
+      .replace(/[\/\-_:,.]+/g, ' ')
+      .replace(/\b(community|program|workshop|days?|train|to|become|a|lawyer|the|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d+)\b/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+    if (!cleaned) continue;
+    const canon = canonicalApiGroup(cleaned);
+    if (entry.apiGroups.some((gf) => canonicalApiGroup(gf) === canon)) return true;
+  }
+  return false;
+}
+
 const FALLBACK_GROUPS = [
   { label: 'ID 76',             inviteLink: 'https://chat.whatsapp.com/D2UdMmSHy4x3TrDMQVRFu5', apiGroups: ['Independent Director'] },
   { label: 'Contract Drafting', inviteLink: 'https://chat.whatsapp.com/HSGGdhy8KYL7IJpSsEsfuf', apiGroups: ['Contract Drafting'] },
@@ -412,21 +436,27 @@ async function syncAlternateNumbers() {
       return;
     }
 
-    const currentMonth = new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' }).slice(0, 7); // "2026-08"
+    // Form timestamps are dd/mm/yyyy (e.g. "04/08/2026 20:15:33"). Index the
+    // current and previous month so month-boundary requests still match.
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const fmtMY = (d) => `${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+    const prev = new Date(now); prev.setMonth(prev.getMonth() - 1);
+    const allowedMonths = [fmtMY(now), fmtMY(prev)];
     rows.slice(1).forEach((r) => {
-      // Only index entries from the current month (faster, more likely to match current requests)
       if (tsCol >= 0) {
-        const ts = String(r[tsCol] || '');
-        if (!ts.startsWith(currentMonth)) return;  // skip old entries
+        const m = String(r[tsCol] || '').match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/); // dd/mm/yyyy
+        if (m && !allowedMonths.includes(`${m[2].padStart(2, '0')}/${m[3]}`)) return; // skip old entries
       }
       const alt = normalizePhone(r[altCol]);
       const orig = normalizePhone(r[origCol]);
       const funnel = (r[funnelCol] || '').trim();
-      if (alt && orig && funnel) {
+      const group = (r[groupCol] || '').trim();
+      // Funnel column is often empty — the group-name answer works as fallback.
+      if (alt && orig && (funnel || group)) {
         newMap.set(alt, {
           original_phone: orig,
           name: (r[nameCol] || '').trim(),
-          group: (r[groupCol] || '').trim(),
+          group: group,
           funnel: funnel,
         });
       }
@@ -434,7 +464,7 @@ async function syncAlternateNumbers() {
 
     if (newMap.size > 0) {
       alternateNumbers = newMap;
-      log(`Alternate numbers sheet (${currentMonth}): ${newMap.size} alternate→original mappings loaded`);
+      log(`Alternate numbers sheet (${allowedMonths.join(' + ')}): ${newMap.size} alternate→original mappings loaded`);
     }
   } catch (e) {
     log(`Alternate numbers sheet fetch failed: ${e.message}`);
@@ -623,16 +653,13 @@ async function checkAndApprove(client) {
         if (!info && phone) {
           const altRec = alternateNumbers.get(phone);
           if (altRec) {
-            // Verify the alternate request is for the correct group/funnel
-            const reqFunnel = canonicalApiGroup(altRec.funnel);
-            const groupMatches = entry.apiGroups.some((gf) => canonicalApiGroup(gf) === reqFunnel);
-            if (groupMatches) {
+            if (altMatchesEntry(entry, altRec)) {
               info = { name: altRec.name, amount: '(paid via alt#)', group: altRec.group };
               method = 'alternate-number-form';
-              recordAltApproval({ group: entry.label, requesterPhone: phone, name: altRec.name, paidPhone: altRec.original_phone, amount: '', funnel: altRec.funnel, method: 'alt-sheet' });
-              log(`[${entry.label}] Alternate number found for ${phone} (original: ${altRec.original_phone}, funnel match: ${reqFunnel})`);
+              recordAltApproval({ group: entry.label, requesterPhone: phone, name: altRec.name, paidPhone: altRec.original_phone, amount: '', funnel: altRec.funnel || altRec.group, method: 'alt-sheet' });
+              log(`[${entry.label}] Alternate number found for ${phone} (original: ${altRec.original_phone}, form: ${altRec.funnel || altRec.group})`);
             } else {
-              log(`[${entry.label}] Alternate number ${phone} found but funnel mismatch (form: ${reqFunnel}, this group: ${entry.apiGroups.join(', ')})`);
+              log(`[${entry.label}] Alternate number ${phone} found but form says different group (form: ${altRec.funnel || altRec.group}, this group: #${entry.groupNumber} ${entry.apiGroups.join(', ')})`);
             }
           }
         }
