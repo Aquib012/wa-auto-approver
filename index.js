@@ -1019,9 +1019,18 @@ async function checkLoop(client) {
 // appears — approval lands ~1-2 min after form submission instead of waiting
 // for the next scheduled sweep. Cheap: one Google CSV fetch per minute.
 let lastAltSignature = '';
+const ROSTER_NOW_FILE = path.join(__dirname, 'roster-now.txt');
 function startAltWatcher(client) {
   setInterval(async () => {
     if (isNight() || sweeping) return;
+    // On-demand roster: `touch roster-now.txt` in the bot folder triggers a
+    // fresh group-wise member list within a minute (written to the Roster tab).
+    if (fs.existsSync(ROSTER_NOW_FILE)) {
+      try { fs.unlinkSync(ROSTER_NOW_FILE); } catch {}
+      log('On-demand roster requested — building group-wise member list...');
+      try { await buildRoster(client); } catch (e) { log(`On-demand roster error: ${e.message}`); }
+      return;
+    }
     try {
       await syncAlternateNumbers();
       const sig = [...alternateNumbers.entries()].map(([k, v]) => k + ':' + v.length).sort().join(',');
