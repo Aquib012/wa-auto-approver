@@ -69,7 +69,9 @@ function canonicalApiGroup(name) {
 // against the sheet's whatsapp Group number, then (b) cleaned text against
 // the funnel aliases.
 function altMatchesEntry(entry, altRec) {
-  const texts = [altRec.funnel, altRec.group].filter(Boolean);
+  // Match ONLY on the form's Funnel name column (G) — the group-name answer
+  // is informational and never used for approval decisions.
+  const texts = [altRec.funnel].filter(Boolean);
   for (const t of texts) {
     // (a) leading group number, e.g. "63/..." or "63 - ..."
     const numM = String(t).match(/^\s*(\d{1,3})\s*[\/\-:.]/);
@@ -451,8 +453,9 @@ async function syncAlternateNumbers() {
       const orig = normalizePhone(r[origCol]);
       const funnel = (r[funnelCol] || '').trim();
       const group = (r[groupCol] || '').trim();
-      // Funnel column is often empty — the group-name answer works as fallback.
-      if (alt && orig && (funnel || group)) {
+      // HARD RULE: the Funnel name column (G) must be filled — rows with a
+      // blank funnel are never used for approval.
+      if (alt && orig && funnel) {
         newMap.set(alt, {
           original_phone: orig,
           name: (r[nameCol] || '').trim(),
