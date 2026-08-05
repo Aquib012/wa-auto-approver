@@ -69,23 +69,20 @@ function canonicalApiGroup(name) {
 // against the sheet's whatsapp Group number, then (b) cleaned text against
 // the funnel aliases.
 function altMatchesEntry(entry, altRec) {
-  // Match ONLY on the form's Funnel name column (G) — the group-name answer
-  // is informational and never used for approval decisions.
-  const texts = [altRec.funnel].filter(Boolean);
-  for (const t of texts) {
-    // (a) leading group number, e.g. "63/..." or "63 - ..."
-    const numM = String(t).match(/^\s*(\d{1,3})\s*[\/\-:.]/);
-    if (numM && entry.groupNumber && String(entry.groupNumber).split('/').includes(numM[1])) return true;
-    // (b) cleaned text → funnel alias
-    const cleaned = String(t).toLowerCase()
-      .replace(/[\/\-_:,.]+/g, ' ')
-      .replace(/\b(community|program|workshop|days?|train|to|become|a|lawyer|the|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d+)\b/g, ' ')
-      .replace(/\s+/g, ' ').trim();
-    if (!cleaned) continue;
-    const canon = canonicalApiGroup(cleaned);
-    if (entry.apiGroups.some((gf) => canonicalApiGroup(gf) === canon)) return true;
-  }
-  return false;
+  // Match ONLY on the form's Funnel name column (G), and only by its FUNNEL
+  // TEXT — the leading number (e.g. "66/Independent Director Community") is
+  // internal group referencing and is ignored: numbers collide across funnels
+  // (SQE #5/#6 vs Arbitration #6/#5), so "76/Independent Director" and
+  // "66/Independent Director" both approve into any Independent Director group.
+  const t = altRec.funnel;
+  if (!t) return false;
+  const cleaned = String(t).toLowerCase()
+    .replace(/[\/\-_:,.]+/g, ' ')
+    .replace(/\b(community|program|workshop|days?|train|to|become|a|lawyer|the|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d+)\b/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+  if (!cleaned) return false;
+  const canon = canonicalApiGroup(cleaned);
+  return entry.apiGroups.some((gf) => canonicalApiGroup(gf) === canon);
 }
 
 const FALLBACK_GROUPS = [
