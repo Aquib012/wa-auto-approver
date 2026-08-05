@@ -140,6 +140,13 @@ let watched = [];        // active group entries (state carried across refreshes
 let nightLogged = false;
 const freshCheckedAt = new Map();  // "label|phone" -> ms of last targeted lookup
 let stats = { date: '', approved: 0, pending: 0, names: [] };
+// Persist daily stats so restarts don't reset the day's approved counter.
+const STATS_FILE = path.join(__dirname, 'stats.json');
+try {
+  const savedStats = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+  const todayIstStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  if (savedStats && savedStats.date === todayIstStr) stats = savedStats;
+} catch { /* first run */ }
 let alternateNumbers = new Map();  // alternate_phone -> {original_phone, name, group, funnel}
 // "label|phone|date" — pending rows already sent to the sheet today.
 // Persisted to disk so bot restarts don't re-post the same people (which
@@ -789,6 +796,7 @@ async function checkAndApprove(client) {
     stats.names.push(...approvedNames);
   }
   stats.pending = stillPending;
+  try { fs.writeFileSync(STATS_FILE, JSON.stringify(stats)); } catch {}
   // One row per day in the sheet, updated in place after every sweep.
   postToSheet({ type: 'daily', row: [stats.date, stats.approved, stats.pending, stats.names.join(', ')] });
   writeStatus({ lastSweepOk: true });
