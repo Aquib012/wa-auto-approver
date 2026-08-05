@@ -596,7 +596,16 @@ async function refreshPaidListFor(entry) {
 // people who paid today or yesterday, so this small 2-day fetch runs right
 // before processing a group's pending requests — new payments land in the
 // allowlist immediately instead of waiting for the next full 14-day refresh.
+// Rate-limit protection: at most one pull per funnel per 10 minutes (twin
+// groups share the funnel's paid list, so one pull covers them all). Truly
+// fresh payers are still caught by the per-person targeted lookup.
+const QUICK_REFRESH_COOLDOWN_MIN = 10;
+const quickRefreshedAt = new Map(); // funnel key -> ms of last pull
 async function quickRefreshRecent(entry) {
+  const funnelKey = entry.apiGroups.join(',');
+  const lastPull = quickRefreshedAt.get(funnelKey) || 0;
+  if (Date.now() - lastPull < QUICK_REFRESH_COOLDOWN_MIN * 60 * 1000) return;
+  quickRefreshedAt.set(funnelKey, Date.now());
   const today = new Date();
   const from = new Date(today); from.setDate(from.getDate() - 1); // yesterday
   const url = `${API_BASE}?from=${fmtDate(from)}&to=${fmtDate(today)}&group=${encodeURIComponent(entry.apiGroups.join(','))}`;
