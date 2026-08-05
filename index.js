@@ -479,8 +479,11 @@ async function syncAlternateNumbers() {
       const group = (r[groupCol] || '').trim();
       // HARD RULE: the Funnel name column (G) must be filled — rows with a
       // blank funnel are never used for approval.
+      // One number can file MULTIPLE forms (e.g. for two different groups) —
+      // keep every entry, not just the newest.
       if (alt && orig && funnel) {
-        newMap.set(alt, {
+        if (!newMap.has(alt)) newMap.set(alt, []);
+        newMap.get(alt).push({
           original_phone: orig,
           name: (r[nameCol] || '').trim(),
           group: group,
@@ -490,7 +493,8 @@ async function syncAlternateNumbers() {
     });
 
     if (newMap.size > 0) {
-      const changed = newMap.size !== alternateNumbers.size;
+      const countRecs = (m) => [...m.values()].reduce((n, v) => n + v.length, 0);
+      const changed = countRecs(newMap) !== countRecs(alternateNumbers);
       alternateNumbers = newMap;
       // The 60s watcher calls this every minute — only log when something changed.
       if (changed) log(`Alternate numbers sheet (${allowedMonths.join(' + ')}): ${newMap.size} alternate→original mappings loaded`);
@@ -706,17 +710,20 @@ async function checkAndApprove(client) {
         let method = 'number-match';
         let info = phone && entry.paidSet && entry.paidSet.has(phone) ? entry.paidInfo[phone] : null;
 
-        // Check if they paid with a different number (alternate number override)
+        // Check if they paid with a different number (alternate number override).
+        // A number may have several form entries (different groups) — approve
+        // if ANY of them matches this group's funnel.
         if (!info && phone) {
-          const altRec = alternateNumbers.get(phone);
-          if (altRec) {
-            if (altMatchesEntry(entry, altRec)) {
+          const altRecs = alternateNumbers.get(phone);
+          if (altRecs && altRecs.length) {
+            const altRec = altRecs.find((r) => altMatchesEntry(entry, r));
+            if (altRec) {
               info = { name: altRec.name, amount: '(paid via alt#)', group: altRec.group };
               method = 'alternate-number-form';
               recordAltApproval({ group: entry.label, requesterPhone: phone, name: altRec.name, paidPhone: altRec.original_phone, amount: '', funnel: altRec.funnel || altRec.group, method: 'alt-sheet' });
               log(`[${entry.label}] Alternate number found for ${phone} (original: ${altRec.original_phone}, form: ${altRec.funnel || altRec.group})`);
             } else {
-              log(`[${entry.label}] Alternate number ${phone} found but form says different group (form: ${altRec.funnel || altRec.group}, this group: #${entry.groupNumber} ${entry.apiGroups.join(', ')})`);
+              log(`[${entry.label}] Alternate number ${phone} found but no form entry matches this group (forms: ${altRecs.map((r) => r.funnel).join(' | ')}, this group: #${entry.groupNumber} ${entry.apiGroups.join(', ')})`);
             }
           }
         }
@@ -1017,7 +1024,7 @@ function startAltWatcher(client) {
     if (isNight() || sweeping) return;
     try {
       await syncAlternateNumbers();
-      const sig = [...alternateNumbers.keys()].sort().join(',');
+      const sig = [...alternateNumbers.entries()].map(([k, v]) => k + ':' + v.length).sort().join(',');
       if (lastAltSignature && sig !== lastAltSignature) {
         log('New alternate-form entry detected — running immediate sweep.');
         await safeSweep(client);
