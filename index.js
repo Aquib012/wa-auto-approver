@@ -543,14 +543,17 @@ async function resolveGroups(client) {
   }
 }
 
-async function refreshPaidListFor(entry) {
+async function refreshPaidListFor(entry, opts = {}) {
+  // opts.days: window size (default full DAYS_BACK); opts.mergeOnly: add-only,
+  // never replace the list (used by the frequent 2-day refresh).
+  const days = opts.days || config.DAYS_BACK;
   const newSet = new Set();
   const newInfo = {};
   const today = new Date();
   const groupFilter = encodeURIComponent(entry.apiGroups.join(','));
 
   let chunksOk = 0, chunksTotal = 0;
-  for (let start = config.DAYS_BACK; start > 0; start -= 7) {
+  for (let start = days; start > 0; start -= 7) {
     chunksTotal++;
     const from = new Date(today); from.setDate(from.getDate() - start);
     const to = new Date(today);   to.setDate(to.getDate() - Math.max(start - 7, 0));
@@ -574,14 +577,24 @@ async function refreshPaidListFor(entry) {
   }
 
   if (newSet.size === 0) {
-    log(`[${entry.label}] Paid list refresh returned 0 rows — keeping previous list (${entry.paidSet ? entry.paidSet.size : 0})`);
+    if (!opts.mergeOnly) log(`[${entry.label}] Paid list refresh returned 0 rows — keeping previous list (${entry.paidSet ? entry.paidSet.size : 0})`);
+    return;
+  }
+
+  if (opts.mergeOnly) {
+    // Frequent short-window refresh: only ever ADD numbers.
+    if (!entry.paidSet) { entry.paidSet = new Set(); entry.paidInfo = {}; }
+    let added = 0;
+    for (const p of newSet) { if (!entry.paidSet.has(p)) { entry.paidSet.add(p); added++; } }
+    Object.assign(entry.paidInfo, newInfo);
+    if (added > 0) log(`[${entry.label}] Quick paid refresh: +${added} new (last ${days} days; total ${entry.paidSet.size})`);
     return;
   }
 
   if (chunksOk === chunksTotal) {
     entry.paidSet = newSet;
     entry.paidInfo = newInfo;
-    log(`[${entry.label}] Paid list refreshed: ${newSet.size} paid numbers (${entry.apiGroups.join(', ')}; ₹${config.MIN_AMOUNT}-${config.MAX_AMOUNT}; last ${config.DAYS_BACK} days)`);
+    log(`[${entry.label}] Paid list refreshed: ${newSet.size} paid numbers (${entry.apiGroups.join(', ')}; ₹${config.MIN_AMOUNT}-${config.MAX_AMOUNT}; last ${days} days)`);
   } else {
     // Partial pull (a chunk errored) — merge instead of replacing, so a transient
     // API failure can never shrink the allowlist.
@@ -961,7 +974,7 @@ async function checkLoop(client) {
 // Refresh paid lists once per unique funnel-set — groups watching the same
 // funnel (e.g. SQE 5 + SQE 6) share one API pull and one in-memory list,
 // halving API calls and avoiding 429 rate limits.
-async function refreshAllPaidLists() {
+async function refreshAllPaidLists(opts = {}) {
   const byFunnel = new Map();
   for (const entry of watched) {
     const key = entry.apiGroups.join(',');
@@ -970,10 +983,24 @@ async function refreshAllPaidLists() {
       entry.paidSet = src.paidSet;
       entry.paidInfo = src.paidInfo;
     } else {
-      await refreshPaidListFor(entry);
+      await refreshPaidListFor(entry, opts);
       byFunnel.set(key, entry);
     }
   }
+}
+
+// Nearly all payers are from today/yesterday, so the frequent refresh only
+// pulls a 2-day window (merge-only). The rare older payment (up to 14 days)
+// is caught by a full deep refresh 3x a day at these IST hours.
+const DEEP_REFRESH_HOURS = [7, 13, 19];
+const doneDeepSlots = new Set(); // "2026-08-05|13"
+function dueDeepSlot() {
+  const ist = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  for (const h of DEEP_REFRESH_HOURS) {
+    const key = `${istDateStr()}|${h}`;
+    if (ist.getHours() >= h && !doneDeepSlots.has(key)) return key;
+  }
+  return null;
 }
 
 async function refreshLoop(client) {
@@ -983,7 +1010,14 @@ async function refreshLoop(client) {
       await syncConfig();         // Load groups from Groups sheet
       await syncAlternateNumbers();
       await resolveGroups(client);
-      await refreshAllPaidLists();
+      const slot = dueDeepSlot();
+      if (slot) {
+        log(`Deep 14-day paid refresh (slot ${slot.split('|')[1]}:00 IST)...`);
+        await refreshAllPaidLists(); // full window, replaces lists
+        doneDeepSlots.add(slot);
+      } else {
+        await refreshAllPaidLists({ days: 2, mergeOnly: true }); // today+yesterday only
+      }
       savePaidCache();
     } catch (e) { log(`Refresh error: ${e.message}`); }
   }
@@ -1004,7 +1038,9 @@ client.on('ready', async () => {
   loadPaidCache();          // warm start — usable allowlist before the first API pull
   await resolveGroups(client);
   await checkAndApprove(client);   // act on anything queued while we were down
-  await refreshAllPaidLists();
+  await refreshAllPaidLists(); // full 14-day pull once at startup
+  // Startup deep pull counts for all deep slots already passed today.
+  let slot; while ((slot = dueDeepSlot())) doneDeepSlots.add(slot);
   savePaidCache();
   await checkAndApprove(client);
 
