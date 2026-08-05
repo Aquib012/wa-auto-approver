@@ -189,6 +189,11 @@ function log(msg) {
   sheetLogBuffer.push([ts, msg]);
 }
 
+function istNow() {
+  // "2026-08-05, 14:29:00 IST" — readable Indian time for all sheet rows
+  return new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata', hour12: false }) + ' IST';
+}
+
 function normalizePhone(raw) {
   const digits = String(raw || '').replace(/\D/g, '');
   return digits.length >= 10 ? digits.slice(-10) : '';
@@ -325,7 +330,7 @@ let usedPaidForName = {};
 try { usedPaidForName = JSON.parse(fs.readFileSync(NAME_APPROVALS_FILE, 'utf8')); } catch {}
 
 function recordAltApproval(rec) {
-  const row = [new Date().toISOString(), rec.group, rec.requesterPhone, rec.name, rec.paidPhone, rec.amount, rec.funnel, rec.method];
+  const row = [istNow(), rec.group, rec.requesterPhone, rec.name, rec.paidPhone, rec.amount, rec.funnel, rec.method];
   const header = 'timestamp,group,requester_phone,matched_name,paid_phone,amount,funnel,method\n';
   try {
     if (!fs.existsSync(ALT_APPROVALS_CSV)) fs.writeFileSync(ALT_APPROVALS_CSV, header);
@@ -733,7 +738,7 @@ async function checkAndApprove(client) {
         if (info) {
           toApprove.push(req.id._serialized);
           approvedNames.push(info.name);
-          postToSheet({ type: 'approval', row: [new Date().toISOString(), entry.label, groupNo, info.name, phone || req.id.user, String(info.amount), info.group, method] });
+          postToSheet({ type: 'approval', row: [istNow(), entry.label, groupNo, info.name, phone || req.id.user, String(info.amount), info.group, method] });
           // If they were reported in the Pending tab earlier, mark that row APPROVED.
           postToSheet({ type: 'pending_resolve', phone: phone || req.id.user, group: entry.label, method });
           log(`[${entry.label} #${groupNo}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${phone || req.id.user} — ${info.name} (₹${info.amount}, ${info.group}) [${method}]`);
@@ -745,7 +750,7 @@ async function checkAndApprove(client) {
           if (!pendingReported.has(pKey)) {
             pendingReported.add(pKey);
             savePendingReported();
-            postToSheet({ type: 'pending', row: [new Date().toISOString(), entry.label, groupNo, '', phone || req.id.user, '', '', 'no payment found (₹100-300)'] });
+            postToSheet({ type: 'pending', row: [istNow(), entry.label, groupNo, '', phone || req.id.user, '', '', 'no payment found (₹100-300)'] });
           }
           log(`[${entry.label} #${groupNo}] NOT PAID (leaving pending): ${phone || req.id.user}${phone ? '' : ' (number unresolved)'}`);
         }
