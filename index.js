@@ -70,28 +70,28 @@ function canonicalApiGroup(name) {
 // the funnel aliases.
 function altMatchesEntry(entry, altRec) {
   // Match ONLY on the form's Funnel name column (G), and only by its FUNNEL
-  // TEXT — the leading number (e.g. "66/Independent Director Community") is
-  // internal group referencing and is ignored: numbers collide across funnels
-  // (SQE #5/#6 vs Arbitration #6/#5), so "76/Independent Director" and
-  // "66/Independent Director" both approve into any Independent Director group.
+  // TEXT — leading numbers are internal references and ignored (they collide
+  // across funnels: SQE #5/#6 vs Arbitration #6/#5).
+  // One cell may list SEVERAL funnels ("55/CRIMINAL/LITIGATION, 5/Arbitration/
+  // community/2026") — approve if ANY listed funnel matches this group.
   const t = altRec.funnel;
   if (!t) return false;
-  const cleaned = String(t).toLowerCase()
-    .replace(/[\/\-_:,.]+/g, ' ')
-    .replace(/\b(community|program|workshop|days?|lawsikho|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d+)\b/g, ' ')
-    .replace(/\s+/g, ' ').trim();
-  if (!cleaned) return false;
-  let canon = API_GROUP_ALIASES[cleaned];
-  if (!canon) {
-    // Fallback: longest alias key appearing as a whole word in the text,
-    // so "sqe 7 day", "21 day arbitration", "ai for legal batch 3" all land.
-    const keys = Object.keys(API_GROUP_ALIASES).sort((a, b) => b.length - a.length);
+  const entryCanons = entry.apiGroups.map((gf) => canonicalApiGroup(gf));
+  const keys = Object.keys(API_GROUP_ALIASES).sort((a, b) => b.length - a.length);
+  for (const part of String(t).split(/[,;&+]/)) {
+    const cleaned = part.toLowerCase()
+      .replace(/[\/\-_:.]+/g, ' ')
+      .replace(/\b(community|program|workshop|days?|lawsikho|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d+)\b/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+    if (!cleaned) continue;
+    const direct = API_GROUP_ALIASES[cleaned];
+    if (direct && entryCanons.includes(direct)) return true;
+    // Check EVERY alias appearing in this part (not just the first found).
     for (const k of keys) {
-      if (new RegExp(`(^| )${k}( |$)`).test(cleaned)) { canon = API_GROUP_ALIASES[k]; break; }
+      if (new RegExp(`(^| )${k}( |$)`).test(cleaned) && entryCanons.includes(API_GROUP_ALIASES[k])) return true;
     }
   }
-  if (!canon) return false;
-  return entry.apiGroups.some((gf) => canonicalApiGroup(gf) === canon);
+  return false;
 }
 
 const FALLBACK_GROUPS = [
