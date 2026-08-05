@@ -141,7 +141,20 @@ let nightLogged = false;
 const freshCheckedAt = new Map();  // "label|phone" -> ms of last targeted lookup
 let stats = { date: '', approved: 0, pending: 0, names: [] };
 let alternateNumbers = new Map();  // alternate_phone -> {original_phone, name, group, funnel}
-const pendingReported = new Set(); // "label|phone|date" — pending rows already sent to the sheet today
+// "label|phone|date" — pending rows already sent to the sheet today.
+// Persisted to disk so bot restarts don't re-post the same people (which
+// created duplicate Pending rows and caused double AiSensy messages).
+const PENDING_REPORTED_FILE = path.join(__dirname, 'pending-reported.json');
+const pendingReported = new Set();
+try {
+  const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  for (const k of JSON.parse(fs.readFileSync(PENDING_REPORTED_FILE, 'utf8'))) {
+    if (k.endsWith(`|${todayIst}`)) pendingReported.add(k); // keep only today's
+  }
+} catch { /* first run — file absent */ }
+function savePendingReported() {
+  try { fs.writeFileSync(PENDING_REPORTED_FILE, JSON.stringify([...pendingReported])); } catch {}
+}
 
 // ---- Google Sheet logging ----
 // Every log line is buffered and flushed to the Apps Script webhook once a
@@ -725,6 +738,7 @@ async function checkAndApprove(client) {
           const pKey = `${entry.label}|${phone || req.id.user}|${istDateStr()}`;
           if (!pendingReported.has(pKey)) {
             pendingReported.add(pKey);
+            savePendingReported();
             postToSheet({ type: 'pending', row: [new Date().toISOString(), entry.label, groupNo, '', phone || req.id.user, '', '', 'no payment found (₹100-300)'] });
           }
           log(`[${entry.label} #${groupNo}] NOT PAID (leaving pending): ${phone || req.id.user}${phone ? '' : ' (number unresolved)'}`);
