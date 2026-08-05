@@ -78,10 +78,19 @@ function altMatchesEntry(entry, altRec) {
   if (!t) return false;
   const cleaned = String(t).toLowerCase()
     .replace(/[\/\-_:,.]+/g, ' ')
-    .replace(/\b(community|program|workshop|days?|train|to|become|a|lawyer|the|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d+)\b/g, ' ')
+    .replace(/\b(community|program|workshop|days?|lawsikho|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d+)\b/g, ' ')
     .replace(/\s+/g, ' ').trim();
   if (!cleaned) return false;
-  const canon = canonicalApiGroup(cleaned);
+  let canon = API_GROUP_ALIASES[cleaned];
+  if (!canon) {
+    // Fallback: longest alias key appearing as a whole word in the text,
+    // so "sqe 7 day", "21 day arbitration", "ai for legal batch 3" all land.
+    const keys = Object.keys(API_GROUP_ALIASES).sort((a, b) => b.length - a.length);
+    for (const k of keys) {
+      if (new RegExp(`(^| )${k}( |$)`).test(cleaned)) { canon = API_GROUP_ALIASES[k]; break; }
+    }
+  }
+  if (!canon) return false;
   return entry.apiGroups.some((gf) => canonicalApiGroup(gf) === canon);
 }
 
