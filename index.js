@@ -154,10 +154,7 @@ let alternateNumbers = new Map();  // alternate_phone -> {original_phone, name, 
 const PENDING_REPORTED_FILE = path.join(__dirname, 'pending-reported.json');
 const pendingReported = new Set();
 try {
-  const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-  for (const k of JSON.parse(fs.readFileSync(PENDING_REPORTED_FILE, 'utf8'))) {
-    if (k.endsWith(`|${todayIst}`)) pendingReported.add(k); // keep only today's
-  }
+  for (const k of JSON.parse(fs.readFileSync(PENDING_REPORTED_FILE, 'utf8'))) pendingReported.add(k);
 } catch { /* first run — file absent */ }
 function savePendingReported() {
   try { fs.writeFileSync(PENDING_REPORTED_FILE, JSON.stringify([...pendingReported])); } catch {}
@@ -757,12 +754,13 @@ async function checkAndApprove(client) {
           postToSheet({ type: 'approval', row: [istNow(), entry.label, groupNo, info.name, phone || req.id.user, String(info.amount), info.group, method] });
           // If they were reported in the Pending tab earlier, mark that row APPROVED.
           postToSheet({ type: 'pending_resolve', phone: phone || req.id.user, group: entry.label, method });
+          if (pendingReported.delete(`${entry.label}|${phone || req.id.user}`)) savePendingReported();
           log(`[${entry.label} #${groupNo}] ${DRY_RUN ? '[DRY RUN] WOULD APPROVE' : 'MATCHED PAID'} ${phone || req.id.user} — ${info.name} (₹${info.amount}, ${info.group}) [${method}]`);
         } else {
           stillPending++;
           // Report each pending person to the sheet once per day (sweeps repeat
           // every few minutes — without this the tab would fill with duplicates).
-          const pKey = `${entry.label}|${phone || req.id.user}|${istDateStr()}`;
+          const pKey = `${entry.label}|${phone || req.id.user}`;
           if (!pendingReported.has(pKey)) {
             pendingReported.add(pKey);
             savePendingReported();
