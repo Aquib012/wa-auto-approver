@@ -1117,12 +1117,16 @@ client.on('ready', async () => {
   await syncAlternateNumbers();
   loadPaidCache();          // warm start — usable allowlist before the first API pull
   await resolveGroups(client);
-  await checkAndApprove(client);   // act on anything queued while we were down
+  if (!isNight()) {
+    await checkAndApprove(client);   // act on anything queued while we were down
+  } else {
+    log('Startup during night pause — no sweeps until 7:00 IST.');
+  }
   await refreshAllPaidLists(); // full 14-day pull once at startup
   // Startup deep pull counts for all deep slots already passed today.
   let slot; while ((slot = dueDeepSlot())) doneDeepSlots.add(slot);
   savePaidCache();
-  await checkAndApprove(client);
+  if (!isNight()) await checkAndApprove(client);
 
   if (process.env.ROSTER_NOW) {
     log('ROSTER_NOW set — running a one-off roster audit.');
