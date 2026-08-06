@@ -873,27 +873,64 @@ async function buildRoster(client) {
     try {
       let chat = null, participants = [];
       try {
-        // Pull members straight from WhatsApp's internal Store — reliable
-        // where getChatById().participants comes back empty.
-        participants = await client.pupPage.evaluate(async (gid) => {
+        // WhatsApp Web internals shift between versions — try several routes
+        // and report which one produced the member list.
+        const probe = await client.pupPage.evaluate(async (gid) => {
+          const shape = (arr) => arr.map(function (p) {
+            const id = (p.id && p.id._serialized) ? p.id._serialized : String(p.id || p);
+            return { id: { _serialized: id }, isAdmin: !!(p.isAdmin || p.isSuperAdmin) };
+          });
           try {
-            let meta = window.Store.GroupMetadata.get(gid);
-            if (!meta && window.Store.WidFactory) {
-              try { await window.Store.GroupMetadata.find(window.Store.WidFactory.createWid(gid)); } catch (e) {}
-              meta = window.Store.GroupMetadata.get(gid);
+            // A) GroupMetadata store (+ async find to force-load)
+            if (window.Store && window.Store.GroupMetadata) {
+              let meta = window.Store.GroupMetadata.get(gid);
+              if (!meta && window.Store.GroupMetadata.find) {
+                try { meta = await window.Store.GroupMetadata.find(gid); } catch (e) {}
+                if (!meta) meta = window.Store.GroupMetadata.get(gid);
+              }
+              if (meta && meta.participants) {
+                const arr = meta.participants.getModelsArray ? meta.participants.getModelsArray() : [];
+                if (arr.length) return { method: 'store-meta', parts: shape(arr) };
+              }
             }
-            if (!meta) return [];
-            try { await window.Store.GroupMetadata.update(gid); } catch (e) {}
-            return meta.participants.getModelsArray().map(function (p) {
-              return { id: { _serialized: p.id._serialized }, isAdmin: !!(p.isAdmin || p.isSuperAdmin) };
-            });
-          } catch (e) { return []; }
+            // B) Chat model's attached groupMetadata
+            if (window.Store && window.Store.Chat) {
+              const c = window.Store.Chat.get(gid);
+              if (c && c.groupMetadata && c.groupMetadata.participants) {
+                const arr = c.groupMetadata.participants.getModelsArray ? c.groupMetadata.participants.getModelsArray() : [];
+                if (arr.length) return { method: 'chat-meta', parts: shape(arr) };
+              }
+            }
+            // C) whatsapp-web.js serialized chat
+            if (window.WWebJS && window.WWebJS.getChat) {
+              const sc = await window.WWebJS.getChat(gid);
+              const arr = (sc && (sc.participants || (sc.groupMetadata && sc.groupMetadata.participants))) || [];
+              if (arr.length) return { method: 'wwebjs-chat', parts: shape(arr) };
+            }
+            // D) group participant query API
+            if (window.Store && window.Store.GroupQueryParticipants) {
+              try {
+                const arr = await window.Store.GroupQueryParticipants(gid);
+                if (arr && arr.length) return { method: 'query-api', parts: shape(arr) };
+              } catch (e) {}
+            }
+            return { method: 'none', diag: JSON.stringify({
+              store: !!window.Store,
+              gm: !!(window.Store && window.Store.GroupMetadata),
+              gmKeys: window.Store && window.Store.GroupMetadata ? (window.Store.GroupMetadata.get(gid) ? 'has-model' : 'no-model') : 'n/a',
+              chat: !!(window.Store && window.Store.Chat),
+              chatModel: !!(window.Store && window.Store.Chat && window.Store.Chat.get(gid)),
+              wjs: !!(window.WWebJS && window.WWebJS.getChat),
+            }), parts: [] };
+          } catch (e) { return { method: 'error: ' + e.message, parts: [] }; }
         }, entry.groupId);
+        participants = probe.parts || [];
         try { chat = await client.getChatById(entry.groupId); } catch (e) { chat = null; }
         if (!participants.length) {
-          log(`[${entry.label}] Store returned 0 members — metadata not loaded, skipping group`);
+          log(`[${entry.label}] Members: 0 via ${probe.method}${probe.diag ? ' | diag ' + probe.diag : ''} — skipping`);
           continue;
         }
+        log(`[${entry.label}] Members fetched: ${participants.length} via ${probe.method}`);
       } catch (e) {
         log(`[${entry.label}] Member fetch failed: ${e.message}`);
         continue;
