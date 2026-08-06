@@ -863,7 +863,7 @@ function csvCell(v) {
 }
 
 async function buildRoster(client) {
-  log('Roster audit starting — collecting members of all watched groups...');
+  log(`Roster audit starting — ${watched.filter((e) => e.groupId).length} groups to scan...`);
   loadLidCache();
   const rows = [];
   const summary = [];
@@ -871,20 +871,32 @@ async function buildRoster(client) {
   for (const entry of watched) {
     if (!entry.groupId) continue;
     try {
-      let chat, participants = [];
+      let chat = null, participants = [];
       try {
-        chat = await client.getChatById(entry.groupId);
-        if (!chat) throw new Error('getChatById returned null');
-        participants = chat.participants || await client.getGroupMembersIds(entry.groupId) || [];
-      } catch (e) {
-        log(`[${entry.label}] Could not get chat/members: ${e.message} — trying groupId directly`);
-        try {
-          const ids = await client.getGroupMembersIds(entry.groupId);
-          participants = ids ? ids.map((id) => ({ id: { _serialized: id } })) : [];
-        } catch (e2) {
-          log(`[${entry.label}] getGroupMembersIds also failed: ${e2.message}`);
+        // Pull members straight from WhatsApp's internal Store — reliable
+        // where getChatById().participants comes back empty.
+        participants = await client.pupPage.evaluate(async (gid) => {
+          try {
+            let meta = window.Store.GroupMetadata.get(gid);
+            if (!meta && window.Store.WidFactory) {
+              try { await window.Store.GroupMetadata.find(window.Store.WidFactory.createWid(gid)); } catch (e) {}
+              meta = window.Store.GroupMetadata.get(gid);
+            }
+            if (!meta) return [];
+            try { await window.Store.GroupMetadata.update(gid); } catch (e) {}
+            return meta.participants.getModelsArray().map(function (p) {
+              return { id: { _serialized: p.id._serialized }, isAdmin: !!(p.isAdmin || p.isSuperAdmin) };
+            });
+          } catch (e) { return []; }
+        }, entry.groupId);
+        try { chat = await client.getChatById(entry.groupId); } catch (e) { chat = null; }
+        if (!participants.length) {
+          log(`[${entry.label}] Store returned 0 members — metadata not loaded, skipping group`);
           continue;
         }
+      } catch (e) {
+        log(`[${entry.label}] Member fetch failed: ${e.message}`);
+        continue;
       }
 
       const history = await fetchPaymentHistory(entry);
@@ -929,7 +941,7 @@ async function buildRoster(client) {
     fs.writeFileSync(path.join(ROSTER_DIR, 'roster-latest.csv'), csv);
   } catch (e) { log(`Could not write roster CSV: ${e.message}`); }
 
-  const webhookUrl = config.ROSTER_WEBHOOK_URL || getConfig('ROSTER_WEBHOOK_URL');
+  const webhookUrl = config.ROSTER_WEBHOOK_URL || ROSTER_WEBHOOK_URL; // falls back to SHEET_WEBHOOK_URL
   if (webhookUrl) {
     try {
       const resp = await fetch(webhookUrl, {
